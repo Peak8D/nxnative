@@ -276,3 +276,17 @@ HLE_FORCE("_ZN2nn10streamplay18GetGuestJcmsStatesEPNS0_14GuestJcmsStateEiRKNS0_1
 HLE_FORCE("_ZN2nn4chat10InitializeEv", "GameChat (chat:u): ready, no chat", void, h_chat_Init, void) {}
 HLE_FORCE("_ZN2nn4chat10IsChattingEv", "GameChat: not chatting", unsigned, h_chat_IsChatting, void) { return 0; }
 HLE_FORCE("_ZN2nn4chat20SetScreenSharingModeENS0_17ScreenSharingModeE", "GameChat screen sharing mode: no chat to share with", void, h_chat_ShareMode, int mode) { (void)mode; }
+// GameChat (nn::chat, Switch 2): offline nobody is chatting. Star Fox (0400E88025B1A000) asks for the chatting user each frame from its title screen on; the sdk read the
+// chat session that Initialize opens (through the chat service the host does not serve) and crashed on a null one (sdk+0x6be4d4, GetChattingUid+0x74). Initialize (above) opens
+// no session; the chatting user is the invalid Uid (zero), there are no audio levels, and the calls that set up sharing or show a system screen do nothing. The camera
+// calls are left alone: a game reaches them only while a chat runs
+typedef struct { uint64_t v[2]; } chat_uid;
+HLE_FORCE("_ZN2nn4chat14GetChattingUidEv", "offline: nobody is chatting, the invalid Uid", chat_uid, h_chat_Uid, void) { chat_uid z = {{0, 0}}; return z; }
+HLE_FORCE("_ZN2nn4chat22GetRealtimeAudioLevelsEPNS0_10AudioLevelEiPKNS_7account23NetworkServiceAccountIdEi", "offline: no chat members, 0 levels", int, h_chat_Levels,
+          void *out, int n, const void *ids, int nid) { (void)out; (void)n; (void)ids; (void)nid; return 0; }
+HLE_FORCE("_ZN2nn4chat13SetSharingKeyERKNS0_10SharingKeyE", "offline (cut): no chat to share into", Result, h_chat_SetKey, const void *k) { (void)k; return RES_OK; }
+HLE_FORCE("_ZN2nn4chat15ClearSharingKeyEv", "offline (cut)", Result, h_chat_ClearKey, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn4chat13ShowChatStartERKNS_7account3UidE", "the chat applet (cut): as if closed at once", Result, h_chat_ShowStart, const void *u) { (void)u; DM_APPLET("chat"); return RES_OK; }
+HLE_FORCE("_ZN2nn4chat22ShowCameraSharingGuideEv", "a system screen (cut): as if closed at once", Result, h_chat_ShowGuide, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn4chat46BeginFullScreenWithLocalCameraAvailableSectionEb", "offline (cut): no camera overlay", Result, h_chat_BeginFull, int b) { (void)b; return RES_OK; }
+HLE_FORCE("_ZN2nn4chat44EndFullScreenWithLocalCameraAvailableSectionEv", "offline (cut): no camera overlay", Result, h_chat_EndFull, void) { return RES_OK; }

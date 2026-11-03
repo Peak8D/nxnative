@@ -47,6 +47,40 @@ HLE_FORCE("_ZN2nn6camera3sdk19CreateCameraContextEPNS_5gsdrv18UniqueNativeHandle
     return RES_OK;
 }
 
+// The camera library above the context (nn::camera, subsdk3 in Star Fox): no camera is connected. Through the context session above, Initialize itself failed in Star Fox
+// (0400E88025B1A000): its webcam module (vwebcam.switch2.cpp, main+0xba53e00) then tore its setup down and read a field only a working Initialize fills (null + 8 at
+// main+0xba54e4c). As on a console with no camera plugged in: the library initializes, its connection-changed and detached events never fire, a query says not connected
+// (0xdc4, which QueryDeviceConnection passes on as one of its two "no device" results) and opening fails with it
+#define CAM_NONE 0xdc4u
+HLE_FORCE("_ZN2nn6camera10InitializeEv", "camera library; no camera: initializes with nothing connected", Result, h_cam_Init, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn6camera8FinalizeEv", "camera library; nothing to close", void, h_cam_Fini, void) {}
+HLE_FORCE("_ZN2nn6camera8ActivateEv", "camera resource (applet); no camera", Result, h_cam_Activate, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn6camera10DeactivateEv", "camera resource (applet); no camera", Result, h_cam_Deactivate, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn6camera21QueryDeviceConnectionERKNS0_13DeviceRequestE", "no camera connected", Result, h_cam_Query, const void *req) { (void)req; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera31GetDeviceConnectionChangedEventEPNS_2os15SystemEventTypeE", "an event that never fires: no camera is ever connected", Result, h_cam_ConnEv, void *ev) {
+    hle_bind_system_event(ev, 1); return RES_OK;
+}
+HLE_FORCE("_ZN2nn6camera16GetDetachedEventEPNS_2os15SystemEventTypeENS0_12DeviceHandleE", "an event that never fires: no camera to detach", Result, h_cam_DetachEv, void *ev, uint64_t dev) {
+    (void)dev; hle_bind_system_event(ev, 1); return RES_OK;
+}
+HLE_FORCE("_ZN2nn6camera10OpenCameraEPNS0_12DeviceHandleERKNS0_13DeviceRequestE", "no camera connected: fails", Result, h_cam_Open, void *dev, const void *req) { (void)dev; (void)req; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera11CloseCameraENS0_12DeviceHandleE", "no camera was opened", void, h_cam_Close, uint64_t dev) { (void)dev; }
+HLE_FORCE("_ZN2nn6camera13GetDeviceInfoEPNS0_10DeviceInfoENS0_12DeviceHandleE", "no camera: fails", Result, h_cam_Info, void *i, uint64_t dev) { (void)i; (void)dev; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera21GetRequiredBufferInfoEPNS0_18RequiredBufferInfoENS0_12DeviceHandleENS0_12OutputFormatE", "no camera: fails", Result, h_cam_BufInfo, void *i, uint64_t dev, uint64_t f) {
+    (void)i; (void)dev; (void)f; return CAM_NONE;
+}
+HLE_FORCE("_ZN2nn6camera25ListAvailableOutputFormatEPNS0_12OutputFormatEPiNS0_12DeviceHandleEi", "no camera: no formats", Result, h_cam_Formats, void *f, int *n, uint64_t dev, int max) {
+    (void)f; (void)dev; (void)max; if (n) *n = 0; return CAM_NONE;
+}
+HLE_FORCE("_ZN2nn6camera24GetDigitalZoomCapabilityEPNS0_21DigitalZoomCapabilityENS0_12DeviceHandleE", "no camera: fails", Result, h_cam_ZoomCap, void *c, uint64_t dev) { (void)c; (void)dev; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera20SetDigitalZoomRegionENS0_12DeviceHandleERKNS0_17DigitalZoomRegionE", "no camera: fails", Result, h_cam_Zoom, uint64_t dev, const void *r) { (void)dev; (void)r; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera12CreateStreamEPNS0_12StreamHandleENS0_12DeviceHandleENS0_12OutputFormatEPviS5_ii", "no camera: no stream", Result, h_cam_Stream,
+          void *st, uint64_t dev, uint64_t f, void *b, int n, void *b2, int a, int c) { (void)st; (void)dev; (void)f; (void)b; (void)n; (void)b2; (void)a; (void)c; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera13DestroyStreamENS0_12StreamHandleE", "no stream was created", void, h_cam_StreamFini, uint64_t st) { (void)st; }
+HLE_FORCE("_ZN2nn6camera16GetReadDoneEventEPNS_2os15SystemEventTypeENS0_12StreamHandleE", "no stream: fails", Result, h_cam_ReadEv, void *ev, uint64_t st) { (void)ev; (void)st; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera18ReadFrameDataAsyncEPmiNS0_12StreamHandleE", "no stream: fails", Result, h_cam_Read, uint64_t *id, int i, uint64_t st) { (void)id; (void)i; (void)st; return CAM_NONE; }
+HLE_FORCE("_ZN2nn6camera12GetFrameInfoEm", "no stream: no frame", Result, h_cam_Frame, uint64_t id) { (void)id; return CAM_NONE; }
+
 HLE_FORCE("_ZN2nn2sf4hipc31InitializeHipcServiceResolutionEv", "service name resolution (connects to sm); the host resolves the names it serves itself", Result, h_sf_InitRes, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn2sf4hipc29FinalizeHipcServiceResolutionEv", "service name resolution (sm)", void, h_sf_FinRes, void) {}
 HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect to a service through sm → a host session for the services the host serves", Result, h_sf_Connect,

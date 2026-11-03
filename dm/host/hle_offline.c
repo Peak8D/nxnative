@@ -48,6 +48,9 @@ HLE_FORCE("_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE", "local wireless 
 // ---------- socket: offline by default (every call -1/ENETDOWN); with DM_NET=1 the calls are the host's own sockets (hle_net.c) ----------
 enum { SK_ENETDOWN = 50, SK_EAI_FAIL = 4 };
 HLE_FORCE("_ZN2nn6socket10InitializeEPvmmi", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_sk_Init4, void *mem, uint64_t sz, uint64_t alloc, int conc) { (void)mem; (void)sz; (void)alloc; (void)conc; return RES_OK; }
+// The SDK's internal entry, which Star Fox (0400E88025B1A000) calls instead of the two above: unhooked, the SDK opened bsd:u / bsd:s / bsd:a itself, which the host does not serve,
+// and the engine aborted at boot (vsocket.nintendo.cpp:148)
+HLE_FORCE("_ZN2nn6socket8internal10InitializeEi", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_sk_InitInternal, int n) { (void)n; return RES_OK; }
 HLE_FORCE("_ZN2nn6socket8FinalizeEv", "pairs with Initialize (cut)", Result, h_sk_Fini, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "offline: ENETDOWN / DM_NET=1: the kept error code", int, h_sk_Errno, void) { return dm_sk_last_error(); }
 HLE_FORCE("_ZN2nn6socket6SocketEiii", "offline (cut) / DM_NET=1: the host's own", int, h_sk_Socket3i, int a, int b, int c) { return dm_sk_socket(a, b, c); }
