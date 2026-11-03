@@ -2,6 +2,8 @@
 // Online accounts (network service account / Nintendo Account authorization / tokens) are out of scope and uniformly return RES_FAIL; the async context's completion event fires immediately.
 // Environment switch: DM_NICK=nickname (default Player).
 #include "hle.h"
+#include "hle_account_image.h"
+#include <string.h>
 
 typedef struct { uint64_t v[2]; } Uid;                 // nn::account::Uid, 16 bytes
 typedef struct { uint64_t v[3]; } UserHandle;          // nn::account::UserHandle, 24 bytes
@@ -97,8 +99,13 @@ HLE_FORCE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", "whether a user exis
     *out = uid->v[0] == k_uid.v[0] && uid->v[1] == k_uid.v[1]; return RES_OK;
 }
 HLE_FORCE("_ZN2nn7account15ShowUserCreatorEv", "user creation applet; the host already has its local user", Result, h_acc_ShowCreator, void) { DM_APPLET("user creator"); return RES_OK; }
-HLE_FORCE("_ZN2nn7account16LoadProfileImageEPmPvmRKNS0_3UidE", "user profile image; the host has none (fails)", Result, h_acc_LoadImage, uint64_t *n, void *buf, uint64_t sz, const Uid *uid) {
-    (void)buf; (void)sz; (void)uid; if (n) *n = 0; return RES_FAIL;
+// The local user's profile image, a 256x256 JPEG as the system keeps one for every user (hle_account_image.h). Fast Fusion loads it for its race results and aborts when it fails;
+// a buffer too small for it or another user fails as before
+HLE_FORCE("_ZN2nn7account16LoadProfileImageEPmPvmRKNS0_3UidE", "user profile image: the host's 256x256 JPEG", Result, h_acc_LoadImage, uint64_t *n, void *buf, uint64_t sz, const Uid *uid) {
+    if (n) *n = 0;
+    if (!uid || uid->v[0] != k_uid.v[0] || uid->v[1] != k_uid.v[1] || !buf || sz < sizeof k_profile_jpeg) return RES_FAIL;
+    memcpy(buf, k_profile_jpeg, sizeof k_profile_jpeg); if (n) *n = sizeof k_profile_jpeg;
+    return RES_OK;
 }
 // The save-data thumbnail is what the system's data management screen shows next to a save (The Great Ace Attorney Chronicles, SDK 10); the host has no such screen and keeps none
 HLE_FORCE("_ZN2nn7account27StoreSaveDataThumbnailImageERKNS0_3UidEPKvm", "save-data thumbnail for the system's data management screen; the host keeps none", Result, h_acc_StoreThumb, const Uid *uid, const void *img, uint64_t n) {
