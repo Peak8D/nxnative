@@ -508,47 +508,51 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
         // SUATOM Rd, [Ra], Rb (0x593): an atomic on an image through a handle, laid out as SUST's (handle 40..59, dimension 61..64) and as ATOMG's (operation
         // 87..91, size 73..76, Pu 81..83). Donkey Kong Bananza's append compute shaders take a counter with it (SUATOM.ADD.U32 on a 1D image, the old value
-        // shuffled to the warp) before their SUST. Another handle bank or a predicate result is not met in a game: refused.
+        // shuffled to the warp) before their SUST. A handle in another bank goes through with it, as SULD's and SUST's (Yoshi's compute shaders: c[3]); a predicate result is refused.
         public static void ASuatom(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
             (int handle, int cbufSlot) = ATexHandle(context, x);
-
-            if (cbufSlot != TextureOperation.DefaultCbufSlot)
-            {
-                throw AFail(context, $"SUATOM handle in bank {cbufSlot}");
-            }
 
             if (x.Bits(81, 84) != 7)
             {
                 throw AFail(context, "SUATOM with a predicate result");
             }
 
-            EmitSuatom(context, (SuDim)x.Bits(61, 64), 0, (SuatomOp)x.Bits(87, 91), (SuatomSize)x.Bits(73, 76), handle, x.Ra, x.Rb, 0, x.Rd, false, isBindless: false, compareAndSwap: false);
+            EmitSuatom(context, (SuDim)x.Bits(61, 64), 0, (SuatomOp)x.Bits(87, 91), (SuatomSize)x.Bits(73, 76), handle, x.Ra, x.Rb, 0, x.Rd, false, isBindless: false, compareAndSwap: false, cbufSlot: cbufSlot);
         }
 
         // SURED [Ra], Rb (0x59f): an image reduction through a handle, SUATOM's layout without a result (handle 40..59, dimension 61..64, coordinates from Ra,
         // the value in Rb; 16..24 is not a destination). No encoder documents it: the fields are Eglantine's lowering of the same instruction to Maxwell
         // SURED.ADD.U32 (lower_to_maxwell.h, commit 11a110898f). Only that form is taken: word 2 0x0010e000 is SUATOM's word 2 in Donkey Kong Bananza's
         // encoding less its predicate result (81..84), so ADD (87..91 = 0) of a U32 (73..76 = 0). Mario Kart World's compute shader adds 1 (MOV R0, 1) at the
-        // coordinate in R4 on a 2D image. The reduction is 87..90 as SUATOM's (Star Fox's compute shaders: word 2 0x0310e000, OR); another word 2 or handle bank is refused.
+        // coordinate in R4 on a 2D image. The reduction is 87..90 as SUATOM's (Star Fox's compute shaders: word 2 0x0310e000, OR); a handle in another bank goes through with it (Yoshi's material shaders: c[3], UE5's SP_GLSL_SAGE); another word 2 is refused.
+        // The size is 73..76 as SUATOM's: U32, or U64 (Yoshi's Nanite rasterizers, FHWRasterizePS / FMicropolyRasterizeCS: SURED.MAX.U64, word 2 0x0110e400, the depth and
+        // the cluster / triangle IDs packed into one 64-bit visibility buffer texel, the value in Rb (low word) and Rb + 1). SPIRV-Cross writes no 64-bit atomic for MSL, so a
+        // 64-bit MAX / MIN goes out as two 32-bit ones on the same texel, the high word first, on the image as R32G32Uint (its binding *_rg32ui), and dmsh_atomic.py
+        // merges each pair into Metal's 64-bit texture atomic on texture2d<ulong> (MSL 3.1, Apple GPU family 9), failing the shader when the pair is not there. Metal's
+        // 64-bit texture atomics are MAX and MIN only; another 64-bit reduction is refused
         public static void ASured(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
+            int size = x.Bits(73, 76); RedOp op = (RedOp)x.Bits(87, 91);
 
-            if ((x.Bits(64, 96) & ~(0xf << 23)) != 0x0010e000 || x.Bits(87, 91) > (int)RedOp.Xor || x.Bits(59, 61) != 0)
+            if ((x.Bits(64, 96) & ~(0xf << 23) & ~(0x7 << 9)) != 0x0010e000 || op > RedOp.Xor || x.Bits(59, 61) != 0 || (size != (int)SuatomSize.U32 && size != (int)SuatomSize.U64) ||
+                (size == (int)SuatomSize.U64 && op is not (RedOp.Max or RedOp.Min)))
             {
                 throw AFail(context, $"SURED form {x.Bits(64, 96):x8}");
             }
 
             (int handle, int cbufSlot) = ATexHandle(context, x);
 
-            if (cbufSlot != TextureOperation.DefaultCbufSlot)
+            if (size == (int)SuatomSize.U64)
             {
-                throw AFail(context, $"SURED handle in bank {cbufSlot}");
+                EmitSured(context, (SuDim)x.Bits(61, 64), 0, op, SuatomSize.U32, handle, x.Ra, x.Rb == RegisterConsts.RegisterZeroIndex ? x.Rb : x.Rb + 1, 0, false, isBindless: false, cbufSlot: cbufSlot, formatOverride: TextureFormat.R32G32Uint);
+                EmitSured(context, (SuDim)x.Bits(61, 64), 0, op, SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false, cbufSlot: cbufSlot, formatOverride: TextureFormat.R32G32Uint);
+                return;
             }
 
-            EmitSured(context, (SuDim)x.Bits(61, 64), 0, (RedOp)x.Bits(87, 91), SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false);
+            EmitSured(context, (SuDim)x.Bits(61, 64), 0, op, SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false, cbufSlot: cbufSlot);
         }
 
         // BAR.SYNC: the workgroup barrier

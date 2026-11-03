@@ -14,7 +14,7 @@ import dmsh_geometry
 def builder_reflection():
     # Isolate pure reflection code from the builder's CLI/profile initialization.
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    names = {'reflect', 'decode_tex', 'decode_ubo_tex', 'const_sampler', 'c2_array'}
+    names = {'reflect', 'decode_tex', 'decode_ubo_tex', 'decode_ubo_img', 'const_sampler', 'c2_array'}
     selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'SSBO' for t in n.targets))
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == 'TEX_BASE' for e in t.elts) for t in n.targets))]
@@ -33,6 +33,25 @@ def bindings(stage, offsets, flags, cb_slot=0):
                       'cb_offset': off // 4, 'flags': flag}
                      for i, (off, flag) in enumerate(zip(offsets, flags))]}
     return REFLECT('synthetic', stage, source, res)
+
+
+class ImagesInUniformBuffers(unittest.TestCase):
+    # Yoshi's UE5 shaders (SP_GLSL_SAGE) take their image handles from the game's own uniform buffer c[3], not from the driver table c[2]
+    def reflect_one(self, decl, body=''):
+        src = 'struct spvDescriptorSetBuffer0\n{\n    ' + decl + ' [[id(9)]];\n};\n' + body
+        return REFLECT('synthetic', 'ps', src, {'sbufs': []})[0]
+
+    def test_atomic_image_handle_in_uniform_slot(self):
+        b = self.reflect_one('texture2d_array<uint, access::read_write> fp_i_cb3_0_r32ui', 'fp_i_cb3_0_r32ui.atomic_fetch_max(uint3(0), 1u);')
+        self.assertEqual((b['kind'], b['reg'], b['off'], b.get('atomic')), ('img_ubo', 0, 0, True))
+
+    def test_store_image_handle_word_offset(self):
+        b = self.reflect_one('texture2d<float, access::write> cp_i_cb4_2_')
+        self.assertEqual((b['kind'], b['reg'], b['off'], b.get('atomic')), ('img_ubo', 1, 8, None))
+
+    def test_driver_table_image_stays_a_slot(self):
+        b = self.reflect_one('texture2d<float, access::write> fp_i_cb2_48_')
+        self.assertEqual((b['kind'], b['reg']), ('img', 0))
 
 
 class StorageBuffers(unittest.TestCase):

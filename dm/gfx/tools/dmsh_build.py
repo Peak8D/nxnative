@@ -712,6 +712,16 @@ def decode_ubo_tex(name):
     if not 3 <= tb <= 16 or ty not in (0, 1, 3) or (ty == 1 and not 3 <= sb <= 16): return None
     return (tb - 3, o0 * 4), (('id', o1) if ty == 3 else (sb - 3, o1 * 4) if ty else (tb - 3, o0 * 4))
 
+def decode_ubo_img(name):
+    """Bindless image: the handle is written by the game into its own uniform buffer (fp_i_cb3_0_r32ui = c[3] word 0: Yoshi's UE5 compute and material shaders, whose
+    SUST / SULD / SUATOM / SURED take their handle there). Returns (uniform slot, byte offset), or None for a handle in the driver table c2 (decode_tex)"""
+    m = re.match(r'[a-z]+_i\w*?_cb(\d+)_([0-9A-F]+)', name)
+    if not m: return None
+    slots, h = int(m.group(1)), int(m.group(2), 16)
+    tb = slots & 0xffff
+    if not 3 <= tb <= 16 or h >> 28: return None
+    return tb - 3, (h & 0x3fff) * 4
+
 def c2_array(name, ty, layout=None):
     """An array of handles in the driver table c2 that the shader indexes at run time (Ryujinx's texture array from a buffer, here bank 2: <stage>_t<type>_cb<slots>_<handle>, declared
     array<element, n>, one element per c2 handle word; the index is the handle's byte offset ÷ 8). Luigi's Mansion 3: 586 pixel shaders sample their shadow cascades from
@@ -808,6 +818,9 @@ def reflect(key, stage, msl, res, layout=None):
             if nm.endswith('Smplr'): e.update(kind=abi.KIND_SAMP_ID, reg=us[1]) if us[0] == 'id' else e.update(kind=abi.KIND_SAMP_UBO, reg=us[0], off=us[1])
             elif 'texture_buffer' in ty: e.update(kind=abi.KIND_UNKNOWN)   # bindless typed buffer: not implemented in the replay layer
             else: e.update(kind=abi.KIND_TEX_UBO, reg=ut[0], off=ut[1])
+        elif decode_ubo_img(nm):   # bindless image: the handle is in a uniform buffer (reg = uniform slot, off = byte offset)
+            e.update(kind=abi.KIND_IMG_UBO, reg=decode_ubo_img(nm)[0], off=decode_ubo_img(nm)[1])
+            if re.search(r'\b%s\.atomic_' % re.escape(nm), msl): e['atomic'] = True   # as for an image slot (below)
         elif c2_array(nm, ty, layout) is not None:   # an array of the driver table's handles (c2_array): the replay fills element k from the slot whose c2 word is at off + 8k
             off, soff = c2_array(nm, ty, layout)   # pyright: ignore[reportGeneralTypeIssues]  (not None: tested above)
             e.update(kind=abi.KIND_SAMP_C2A if nm.endswith('Smplr') else abi.KIND_TEX_C2A, off=off, **({'soff': soff} if soff is not None else {}))
@@ -1419,7 +1432,7 @@ for e, n in collections.Counter(u for x in ok for u in x['drv_unfillable']).most
 f1 = [b for x in ok for b in x['bindings'] if b.get('fetch1d')]
 print(f'1D integer fetches read as 2D rows of 16384 texels (a texture buffer there is bound as rows, nvn_mtl.m tbuf_as_2d): {len(f1)} bindings in {sum(any(b.get("fetch1d") for b in x["bindings"]) for x in ok)} shaders, '
       f'{sum(1 for b in f1 if b.get("fetch1d_size"))} of them also size-queried')
-SLOTK = {abi.KIND_CBUF, abi.KIND_SAMP, abi.KIND_SAMP_TEX, abi.KIND_TEX, abi.KIND_IMG, abi.KIND_TBUF, abi.KIND_SBUF, abi.KIND_UBO_PTR, abi.KIND_SBUF_UBO, abi.KIND_TEX_UBO, abi.KIND_SAMP_UBO, abi.KIND_SAMP_ID}
+SLOTK = {abi.KIND_CBUF, abi.KIND_SAMP, abi.KIND_SAMP_TEX, abi.KIND_TEX, abi.KIND_IMG, abi.KIND_IMG_UBO, abi.KIND_TBUF, abi.KIND_SBUF, abi.KIND_UBO_PTR, abi.KIND_SBUF_UBO, abi.KIND_TEX_UBO, abi.KIND_SAMP_UBO, abi.KIND_SAMP_ID}
 noreg = [x for x in ok if any(b['kind'] in SLOTK and b.get('reg') is None for b in x['bindings'])]
 unk = [x for x in ok if any(b['kind'] == abi.KIND_UNKNOWN for b in x['bindings'])]
 print(f'shaders with a binding whose slot was not decoded {len(noreg)}, with an unrecognized binding kind {len(unk)} (loading them at run time prints [RED] lines)')

@@ -1954,13 +1954,17 @@ static void pkg_absorb_take(NvPkg *pk, const tex_t *t) {
 // Usage an NVN image takes: shader writes, and for R32Uint / R32Sint the shader-atomic usage too, since Metal runs texture atomics only on such textures (dummy_img_atomic) and NVN does
 // not say which images a shader will use atomically
 static inline int pf_r32i(MTLPixelFormat pf) { return pf == MTLPixelFormatR32Uint || pf == MTLPixelFormatR32Sint; }
+// RG32Uint too where the GPU has Metal's 64-bit texture atomics (MAX / MIN on texture2d<ulong>: Apple GPU family 9, the M3 and A17 Pro on), which Nanite's visibility buffer
+// takes (dmsh_atomic.py merge_atomic64); elsewhere such an image gets no atomic usage and its 64-bit atomics a write sink (img_atomic_ok)
+static int gpu_atomic64(void) { static int v = -1; if (v < 0) v = [g_dev supportsFamily:MTLGPUFamilyApple9] ? 1 : 0; return v; }
+static inline int pf_atomic(MTLPixelFormat pf) { return pf_r32i(pf) || (pf == MTLPixelFormatRG32Uint && gpu_atomic64()); }
 static MTLTextureUsage img_usage(const tex_t *t, MTLPixelFormat pf) {
     if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) return 0;
-    return MTLTextureUsageShaderWrite | (pf_r32i(pf) ? MTLTextureUsageShaderAtomic : 0);
+    return MTLTextureUsageShaderWrite | (pf_atomic(pf) ? MTLTextureUsageShaderAtomic : 0);
 }
 // Metal leaves MTLTextureUsageShaderAtomic out of a texture's usage property (0x3 for a texture made with 0x23), so it cannot be read back: every shader-writable R32Uint / R32Sint
 // texture the host makes has it (img_usage, tex_upgrade, dummy_img_atomic), and that is what this tests
-static int tex_atomic_capable(id<MTLTexture> base) { return pf_r32i(base.pixelFormat) && (base.usage & MTLTextureUsageShaderWrite); }
+static int tex_atomic_capable(id<MTLTexture> base) { return pf_atomic(base.pixelFormat) && (base.usage & MTLTextureUsageShaderWrite); }
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
@@ -7237,14 +7241,15 @@ static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, in
 // Resolve shader image writes before an encoder is opened. Snowdrop's cf5ba107e29b51f4 writes a COMPRESSIBLE-only R16F texture registered with RegisterTexture, not RegisterImage.
 // An image bind may follow rendering into a texture created without IMAGE; upgrading it inside encode_args would
 // copy out of an attachment while its render pass was still open. Close that pass first, then replace the shared backing (all registered sampled views follow g_ser_gen).
+static uint64_t img_h(const nvn_rbind *b, int stage, const uint64_t *img);
 static void image_prepare(NvProg *pr, unsigned stages) {
     if (!pr) return;
     for (int st = 0; st < 6; st++) {
         if (!(stages & (1u << st))) continue;
         NvShader *sh = pr->sh[st]; if (!sh) continue;
         for (int i = 0; i < sh->rf.nb; i++) {
-            const nvn_rbind *b = &sh->rf.b[i]; if (b->kind != NVN_RB_IMG || b->reg >= 32 || (!b->rw && !b->atom)) continue;
-            int tid = (int)(S.img[st][b->reg] & 0xfffff); if (tid <= 0) continue;
+            const nvn_rbind *b = &sh->rf.b[i]; if (b->kind != NVN_RB_IMG || (!b->ubo && b->reg >= 32) || (!b->rw && !b->atom)) continue;
+            int tid = (int)(img_h(b, st, S.img[st]) & 0xfffff); if (tid <= 0) continue;
             os_unfair_lock_lock(&g_rmu);
             if (tid >= g_ntreg || !g_treg[tid].ok || g_treg[tid].gone) { os_unfair_lock_unlock(&g_rmu); continue; }
             // The actual image binding is image intent too: some engines write a descriptor with RegisterTexture and use its handle in an image slot.
@@ -7272,11 +7277,11 @@ static void image_prepare(NvProg *pr, unsigned stages) {
 // much as a linear one's pool memory. They used to go through a raw pointer beside the texture, which for a block-linear image (a deswizzled copy) could only be a scratch buffer
 // nothing read, and a 3D image's did not compile. Metal allows texture atomics only on an R32Uint / R32Sint texture made with the shader-atomic usage (img_usage); any other
 // texture in an atomic slot is replaced by an atomic-capable write sink, logged red, rather than left to the GPU's undefined behaviour
-static id<MTLTexture> dummy_img_atomic(int dtt, int dpf) {
-    static __strong id<MTLTexture> cache[8][2];
-    int s = dpf == NVN_DPF_SINT; id<MTLTexture> t = cache[dtt & 7][s]; if (t) return t;
-    MTLPixelFormat pf = s ? MTLPixelFormatR32Sint : MTLPixelFormatR32Uint;
-    MTLTextureUsage u = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic;
+static id<MTLTexture> dummy_img_atomic(int dtt, int dpf, int a64) {   // a64: for a texture2d<ulong> binding (RG32Uint; atomic-capable only with gpu_atomic64)
+    static __strong id<MTLTexture> cache[8][3];
+    int s = a64 ? 2 : dpf == NVN_DPF_SINT; id<MTLTexture> t = cache[dtt & 7][s]; if (t) return t;
+    MTLPixelFormat pf = a64 ? MTLPixelFormatRG32Uint : s ? MTLPixelFormatR32Sint : MTLPixelFormatR32Uint;
+    MTLTextureUsage u = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | (a64 && !gpu_atomic64() ? 0 : MTLTextureUsageShaderAtomic);
     if ((MTLTextureType)dtt == MTLTextureTypeTextureBuffer) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:pf width:16 resourceOptions:MTLResourceStorageModePrivate usage:u];
         id<MTLBuffer> b = [g_dev newBufferWithLength:256 options:MTLResourceStorageModePrivate]; res_add(b);
@@ -7290,7 +7295,8 @@ static id<MTLTexture> dummy_img_atomic(int dtt, int dpf) {
 }
 static int img_atomic_ok(id<MTLTexture> t, const nvn_rbind *b) {
     id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
-    return pf_r32i(t.pixelFormat) && tex_atomic_capable(base) && t.textureType == (MTLTextureType)b->dtt && t.sampleCount == 1;
+    int fmt = b->a64 ? t.pixelFormat == MTLPixelFormatRG32Uint && gpu_atomic64() : pf_r32i(t.pixelFormat);   // a 64-bit atomic's texture2d<ulong> takes an RG32Uint texture, a 32-bit one's an R32
+    return fmt && tex_atomic_capable(base) && t.textureType == (MTLTextureType)b->dtt && t.sampleCount == 1;
 }
 // Snapshot substitution for same-pass feedback sampling (registered by fb_prepare, used by encode_args; see the notes before draw)
 static uint64_t g_draw_seq, g_fb_seq, g_fb_count; static int g_fb_n, g_fb_rebind;
@@ -7464,6 +7470,12 @@ static uint32_t ubo_handle(int stage, int reg, int off) { uint32_t h; ubo_read(s
 // A handle read from a uniform buffer names IDs of the pools bound when the draw runs: as bound handles are moved at recording (hle_nvn.c bind_handles), these take the bases here (0 = none)
 static int ubo_tex_id(uint32_t h) { int t = (int)(h & 0xfffff); return t ? t + S.tex_base : 0; }
 static int ubo_samp_id(uint32_t h) { int s = (int)(h >> 20); return s ? s + S.samp_base : 0; }
+// An image binding's handle at the draw: its image slot's, or for an image whose handle the game keeps in its own uniform buffer (img_ubo: Yoshi's UE5 compute and material
+// shaders, c[3]) the word there, its texture ID moved to the bound pool's part of the table as bound image handles are (bind_handles)
+static uint64_t img_h(const nvn_rbind *b, int stage, const uint64_t *img) {
+    if (b->ubo) return stage >= 0 && stage < 6 ? (uint64_t)ubo_tex_id(ubo_handle(stage, b->reg, b->off)) : 0;
+    return b->reg < 32 ? img[b->reg] : 0;
+}
 int dm_sdk_ounce(void);
 static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute, and c0 + 4 on NVN2)
 static uint32_t g_draw_binst;   // the current draw's base instance (draw), for c0 + 0x644
@@ -7591,7 +7603,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // Storage image: NVN image slot r (BindImages) ↔ D3D u_r
-            int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
+            int tid = (int)(img_h(b, nvn_stage, S.img[nvn_stage]) & 0xfffff);
             uint64_t trid; int real;
             id<MTLTexture> t = img_binding(tid, b, &trid, &real);
             int snap = real && g_fb_n && !b->rw && !b->atom && fb_image_view(tid, b, t) ? fb_snapshot_slot(nvn_stage, t) : -1;
@@ -7600,7 +7612,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (real) { id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
                     RED_ONCE(93, "image atomics on a texture Metal cannot run them on (shader %s stage %d slot %d texture ID %d: Metal format %lu of base format %lu, type %lu for %u, %s): they go to a write sink",
                              sh->key, nvn_stage, reg, tid, (unsigned long)t.pixelFormat, (unsigned long)base.pixelFormat, (unsigned long)t.textureType, b->dtt, base.usage & MTLTextureUsageShaderWrite ? "shader-writable" : "not shader-writable"); }
-                t = dummy_img_atomic(b->dtt, b->dpf); trid = t.gpuResourceID._impl; real = 0;
+                t = dummy_img_atomic(b->dtt, b->dpf, b->a64); trid = t.gpuResourceID._impl; real = 0;
             } else if (b->atom && !(sh->logged & 2)) { sh->logged |= 2; static int nlog; const tex_t *tt = tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid].t : NULL;
                 if (tt && nlog++ < 8) MLOG("shader %s (stage %d): image atomics on image slot %d, texture ID %d (target %d, %s, %llu bytes)", sh->key, nvn_stage, reg, tid, (int)tt->d.target,
                                            tt->d.target == NVN_TEXTURE_TARGET_BUFFER || (tt->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" : "block-linear", (unsigned long long)tt->L.size); }
@@ -8445,7 +8457,7 @@ static void sdx_walk(const uint8_t *p, int depth) {
                 const prog_t *pp = h.op == OP_DISPATCH ? g_pp_cprog : g_pp_prog; __unsafe_unretained NvProg *pr = pp ? prog_get(pp) : nil;
                 if (!pr) { for (int st = 0; st < 6; st++) for (int k = 0; k < NTEX + 32; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], p, 0, 0, SDX_READ, 0, 0, 1}); }
                 else for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || (h.op == OP_DISPATCH) != (st == 5)) continue;
-                    for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; int k = b->kind == NVN_RB_IMG ? NTEX + b->reg : (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) ? b->reg : -1;
+                    for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; int k = b->kind == NVN_RB_IMG ? (b->ubo ? -1 : NTEX + b->reg) : (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) ? b->reg : -1;
                         if (k < 0 || k >= NTEX + 32 || sh->stage < 0 || sh->stage >= 6) continue; uint64_t ser = g_pp_slot[sh->stage][k];
                         if (ser) sdx_ev_add((sdx_ev){seq, 0, ser, p, 0, 0, SDX_READ, 0, 0, 1}); } }
                 const p_set_rt *r = g_pp_rt;
@@ -8668,6 +8680,7 @@ static int prog_samples_ser(const prog_t *pg, uint64_t tex[6][NTEX], uint64_t im
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
+            if (b->kind == NVN_RB_IMG && b->ubo) return 1;   // a handle from a uniform buffer: any texture
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(tex[sh->stage], img[sh->stage], b->reg); else continue;
             if (h && h_ser(h) == ser) return 1; } }
     return 0;
@@ -8689,6 +8702,7 @@ static int defer_prog_hits(const prog_t *pg, uint64_t tex[6][NTEX], uint64_t img
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage < 0 || sh->stage >= 6) continue;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h = 0;
+            if (b->kind == NVN_RB_IMG && b->ubo) return 1;   // a handle from a uniform buffer: any texture
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0;
             else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(tex[sh->stage], img[sh->stage], b->reg);
             else continue;
@@ -8702,6 +8716,7 @@ static void defer_collect_reads(defer_t *d, const prog_t *pg, uint64_t tex[6][NT
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr) { d->nreads = 513; return; }
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage < 0 || sh->stage >= 6) continue;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h = 0;
+            if (b->kind == NVN_RB_IMG && b->ubo) { d->nreads = 513; return; }   // a handle from a uniform buffer: the reads are not known
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0;
             else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(tex[sh->stage], img[sh->stage], b->reg);
             else continue;
@@ -9015,6 +9030,7 @@ planned:
         int touches = 0;
         for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr2->sh[st]; if (!sh || sh->stage >= 6) continue;
             for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *bb = &sh->rf.b[i]; uint64_t h;
+                if (bb->kind == NVN_RB_IMG && bb->ubo) return;   // a handle from a uniform buffer: what the next program reads is not known
                 if (bb->kind == NVN_RB_IMG) h = bb->reg < 32 ? i2[sh->stage][bb->reg] : 0; else if (bb->kind == NVN_RB_TEX || bb->kind == NVN_RB_TBUF) h = tex_slot_h(t2[sh->stage], i2[sh->stage], bb->reg); else continue;
                 uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
                 int j = -1; for (int m = 0; m < R.rt.n; m++) if (R.rt.color[m] && R.rt.color[m]->serial == ser) { j = m; break; }
@@ -9182,7 +9198,7 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
     int fx[32]; for (int i = 0; i < 32; i++) fx[i] = -1; uint8_t fbmask = 0;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
-            if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(S.tex[sh->stage], S.img[sh->stage], b->reg); else continue;
+            if (b->kind == NVN_RB_IMG) h = img_h(b, sh->stage, S.img[sh->stage]); else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(S.tex[sh->stage], S.img[sh->stage], b->reg); else continue;
             uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
             int j = -1; for (int m = 0; m < g_fz.n1; m++) if (R.rt.color[m] && R.rt.color[m]->serial == ser) { j = m; break; }
             if (j < 0) continue;   // What is sampled is not an attachment of the earlier pass
@@ -9532,7 +9548,7 @@ static void fb_prepare(NvProg *pr) {
     uint64_t tile[4]; int ntile = fb_tile_plan(pr, wm, tile);
     for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) {
         const nvn_rbind *b = &fs->rf.b[i];
-        int image = b->kind == NVN_RB_IMG && !b->rw && !b->atom && b->reg < 32;
+        int image = b->kind == NVN_RB_IMG && !b->ubo && !b->rw && !b->atom && b->reg < 32;
         if (!image && (b->kind != NVN_RB_TEX || b->reg >= NTEX)) continue;
         uint64_t handle = image ? S.img[1][b->reg] : tex_slot_h(S.tex[1], S.img[1], b->reg);
         int tid = (int)(handle & 0xfffff); if (!tid) continue;
@@ -9982,7 +9998,7 @@ static int lc_sampled(NvProg *pr) {
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
         if (sh->rf.bindless || sh->rf.dyn) return 1;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
-            if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(S.tex[sh->stage], S.img[sh->stage], b->reg); else continue;
+            if (b->kind == NVN_RB_IMG) h = img_h(b, sh->stage, S.img[sh->stage]); else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = tex_slot_h(S.tex[sh->stage], S.img[sh->stage], b->reg); else continue;
             uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
             for (int gi = 0; gi < g_nlc; gi++) { const lc_group *g = &g_lc[gi];
                 for (int k = 0; k < 8; k++) if (g->clear_c[k] && g->rt.color[k] && g->rt.color[k]->serial == ser) return 1;

@@ -39,6 +39,8 @@ typedef struct {
     uint8_t f1d;             // TEX: read by 1D integer fetches as 2D rows of 16384 texels (dmsh_build.py "fetch1d"): a buffer texture here is bound as such rows (nvn_mtl.m tbuf_as_2d)
     uint8_t atom;            // IMG: the shader runs image atomics on it (dmsh_build.py "atomic"): the texture must allow Metal's texture atomics (nvn_mtl.m dummy_img_atomic)
     uint8_t bw;              // SAMP / SAMPT / SAMPU / SAMPI: a twin sampler for border colours (dmsh_build.py border_emu), its bit in the BORDER block + 1; 0 = an ordinary sampler binding
+    uint8_t ubo;             // IMG: the image handle is in uniform slot reg at byte off (img_ubo), not in image slot reg (nvn_mtl.m img_h)
+    uint8_t a64;             // IMG: a texture2d<ulong> / texture2d_array<ulong>, the 64-bit image atomics of dmsh_atomic.py merge_atomic64 (an RG32Uint texture: img_atomic_ok)
 } nvn_rbind;
 typedef struct {
     int nb, abi, nv;         // Binding count, argument buffer slot, vertex input count

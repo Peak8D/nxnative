@@ -674,10 +674,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             }
             // Metal's texture atomics (MSL 3.1) cover buffer, 2D, 2D-array and 3D textures of
             // R32Uint / R32Sint; source 1D surfaces arrive here already normalized to 2D.
+            // R32G32Uint: one half of a 64-bit MAX / MIN (InstEmitAmpereMem ASured, Nanite's visibility buffer),
+            // which dmsh_atomic.py merges with the other into Metal's 64-bit texture atomic: 2D and 2D-array only.
+            TextureFlags atomOp = texOp.Flags & TextureFlags.AtomicMask;
+            bool half64 = texOp.Format == TextureFormat.R32G32Uint && (atomOp == TextureFlags.Maximum || atomOp == TextureFlags.Minimum) &&
+                (texOp.Type == SamplerType.Texture2D || texOp.Type == (SamplerType.Texture2D | SamplerType.Array));
             if (bounded && (declaration.IsIndexed ||
                 (texOp.Type != SamplerType.TextureBuffer && texOp.Type != SamplerType.Texture2D &&
                  texOp.Type != (SamplerType.Texture2D | SamplerType.Array) && texOp.Type != SamplerType.Texture3D) ||
-                (texOp.Format != TextureFormat.R32Uint && texOp.Format != TextureFormat.R32Sint)))
+                (texOp.Format != TextureFormat.R32Uint && texOp.Format != TextureFormat.R32Sint && !half64)))
             {
                 throw new NotSupportedException("Metal image atomics support non-indexed 32-bit buffer/2D/2D-array/3D images only.");
             }
