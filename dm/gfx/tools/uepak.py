@@ -568,6 +568,21 @@ def lslg(s):
     if c < 4 or struct.unpack_from('<I', s, c - 4)[0] != ncode or k + nctl > len(s): return None
     return s[4:6].decode('latin1'), s[k:k + nctl], s[c:c + ncode]
 
+NVN2_CTL = b'\x34\x12\x76\x98\xc9\x00\x00\x00'   # an NVN2 control section's magic and version (shader_split.py nvn2_ctl)
+IO_EXPORT_BUNDLE = 1   # EIoChunkType ExportBundleData (Unreal Engine 5 numbering): the packages' export data, where a material keeps its shader map when the code is not shared
+
+def sage(s):
+    """A decoded Switch 2 shader of Unreal Engine 5 (shader platform SP_GLSL_SAGE, Yoshi's project PJ045): a header and the shader's source name
+    (Global/FShader_VirtualTextureCopy_PS<...>|CopyBaseColorNormalSpecularPS), then u32 code length, the code area (Ampere code from its SPH, no code header), u32 control length,
+    the NVN2 control section (0xe0 or 0xf0 bytes) and a 12-byte tail. The control section names the code area's length at +0x44, as every NVN2 one does.
+    → (control section, code area), or None if the layout differs"""
+    k = s.rfind(NVN2_CTL)
+    if k < 12 or k + 0x48 > len(s): return None
+    nctl, ncode = struct.unpack_from('<I', s, k - 4)[0], struct.unpack_from('<I', s, k + 0x44)[0]
+    c = k - 4 - ncode
+    if not 0x48 <= nctl <= len(s) - k or c < 4 or struct.unpack_from('<I', s, c - 4)[0] != ncode: return None
+    return s[k:k + nctl], s[c:c + ncode]
+
 if __name__ == '__main__':
     try:
         cmd = sys.argv[1] if len(sys.argv) > 1 else ''

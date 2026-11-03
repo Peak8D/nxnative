@@ -1898,10 +1898,7 @@ def smash_arc_shaders(path, rel, ents, out):
             if len(out) == n and b'\x91\x68\x86\x19' in b: out.extend(glslc_shaders(b, label, need=False))
 
 _OODLE = None
-def oodle(comp, n):
-    """The game's own decoder: OodleLZ_Decompress (Trinity's packs are Oodle Mermaid, Pokémon Legends: Arceus's GFPAK entries Oodle Kraken, and Oodle is linked into main), or LZ5_decompress_safe (DRAGON QUEST XI S's legacy Unreal paks):
-    one Mac host per worker process in its tool mode (dm/host/hle_oodle.c, DM_OODLE_SERVE), fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads
-    (the NSP script sets both for a game with Trinity packs, Oodle PKZ or GFPAK entries, or legacy Unreal paks, profile_guess.py shader_sources)"""
+def oodle_host():   # this worker's Mac host in its decoder tool mode, started on first use: (process, its stderr file)
     global _OODLE
     if _OODLE is None:
         import tempfile
@@ -1909,7 +1906,13 @@ def oodle(comp, n):
         if not host or not mods: red('Oodle- or LZ5-compressed game files: set DM_OODLE_HOST (the Mac host, make -C dm/host GAME=<id> dmhost) and DM_OODLE_MODULES (the rewritten modules) to decode them with the game\'s own decoder')
         err = tempfile.TemporaryFile()
         _OODLE = (subprocess.Popen([host, mods], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, env=dict(os.environ, DM_OODLE_SERVE='1')), err)
-    p, err = _OODLE
+    return _OODLE
+
+def oodle(comp, n):
+    """The game's own decoder: OodleLZ_Decompress (Trinity's packs are Oodle Mermaid, Pokémon Legends: Arceus's GFPAK entries Oodle Kraken, and Oodle is linked into main), or LZ5_decompress_safe (DRAGON QUEST XI S's legacy Unreal paks):
+    one Mac host per worker process in its tool mode (dm/host/hle_oodle.c, DM_OODLE_SERVE), fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads
+    (the NSP script sets both for a game with Trinity packs, Oodle PKZ or GFPAK entries, or legacy Unreal paks, profile_guess.py shader_sources)"""
+    p, err = oodle_host()
     try:
         p.stdin.write(struct.pack('<QQ', len(comp), n)); p.stdin.write(comp); p.stdin.flush()
         got = struct.unpack('<Q', p.stdout.read(8))[0]
@@ -1917,6 +1920,19 @@ def oodle(comp, n):
     if got != n:
         err.seek(0); red(f'the game\'s decoder in the Mac host failed on a {len(comp)} → {n} byte stream; ---- host output ----\n' + err.read().decode(errors='replace')[-3000:])
     return p.stdout.read(n)
+
+def oodle_try(comp, n):
+    """oodle() for bytes that only look like an Oodle block (Unreal Engine 5's inline shader entries, found by their layout): None when the game's decoder does not give n bytes
+    from them. The server answers 0 bytes for a stream it rejects and stays in step; a host that died on one is started again for the next"""
+    global _OODLE
+    p, err = oodle_host()
+    try:
+        p.stdin.write(struct.pack('<QQ', len(comp), n)); p.stdin.write(comp); p.stdin.flush()
+        got = struct.unpack('<Q', p.stdout.read(8))[0]
+    except (BrokenPipeError, struct.error):
+        p.kill(); _OODLE = None; return None
+    s = p.stdout.read(got) if got else b''
+    return s if got == n else None
 
 def trinity_shaders(path, rel, packs, out):
     """A range of Trinity packs (trpfs_jobs). Pack table: 0 file hashes [u64], 1 files [{1 compression i8 (3 = Oodle; stored otherwise), 2 level u8, 3 length u64, 4 data [u8]}]; each file is scanned like a loose one"""
@@ -2008,6 +2024,18 @@ def ue_legacy_jobs(files, parts=64):
                 for start in range(0, len(tc.ids), chunk_step):
                     end = min(start + chunk_step, len(tc.ids))
                     jobs.append((p, r, (UE_IOSTORE, (start, end))))
+            # Unreal Engine 5 with the material shaders inline (Yoshi, PJ045-Sage.utoc, TOC version 6: no shader library chunks, the pak beside it holds the global shader cache):
+            # the export data chunks, in jobs of about equal size (25 GB of them, Oodle blocks decoded by the game's decoder). Only beside a pak of inline shaders, which is
+            # what gives this step the game's decoder; UE 5 containers with shader libraries (FINAL FANTASY RESONANCE) are the NSP script's decode step
+            elif not tc.encrypted and paks and not tc.of_type(uepak.IO_SHADER_LIBRARY):
+                idx = [i for i, c in enumerate(tc.ids) if c[11] == uepak.IO_EXPORT_BUNDLE]
+                if not idx: continue
+                toc_taken.add(p); toc_taken.update(p[:-5] + (f'_s{k}' if k else '') + '.ucas' for k in {at // tc.part_size for at, *_ in tc.blocks})
+                total = sum(tc.ranges[i][1] for i in idx); step, cur, size = total / parts or 1, [], 0
+                for i in idx:
+                    cur.append(i); size += tc.ranges[i][1]
+                    if size >= step: jobs.append((p, r, (UE_IOSTORE, tuple(cur)))); cur, size = [], 0
+                if cur: jobs.append((p, r, (UE_IOSTORE, tuple(cur))))
         except (OSError, ValueError): pass
     return jobs, {p for p, _ in paks} | toc_taken
 
@@ -2023,13 +2051,19 @@ def ue_legacy_shaders(path, rel, names, out):
         ue_inline_shaders(d, f'/{rel}#{label}', out)
 
 _TOCS = {}
-def ue_iostore_shaders(path, rel, chunk_range, out):
+def ue_iostore_shaders(path, rel, chunks, out):
+    """Chunks of an IoStore container (ue_legacy_jobs): Unreal Engine 4's as a (start, end) range of indices, labelled by index; Unreal Engine 5's as the indices themselves, labelled
+    by chunk ID (the containers' directory index is stripped, so no package path), their Oodle blocks through the game's decoder"""
     tc = _TOCS.get(path) or _TOCS.setdefault(path, uepak.Toc(path))
-    start, end = chunk_range
-    for i in range(start, min(end, len(tc.ids))):
-        try: d = tc.read(i)
-        except (OSError, ValueError): continue
-        ue_inline_shaders(d, f'/{rel}#chunk_{i}', out)
+    if tc.version < 4:
+        start, end = chunks
+        for i in range(start, min(end, len(tc.ids))):
+            try: d = tc.read(i)
+            except (OSError, ValueError): continue
+            ue_inline_shaders(d, f'/{rel}#chunk_{i}', out)
+        return
+    for i in chunks:
+        ue_inline_shaders(tc.read(i, decode=oodle), f'/{rel}#{tc.ids[i].hex()}', out)
 
 ZLIB_HEAD = re.compile(b'\x78[\x01\x5e\x9c\xda]')
 def ue_inline_shaders(d, label, out):
@@ -2069,6 +2103,43 @@ def ue_inline_shaders(d, label, out):
             try: s = lz4.block.decompress(d[j:j + n], uncompressed_size=raw)
             except Exception: continue
             if len(s) == raw and s[:4] == b'LSLG': take(s, j); break
+    # Unreal Engine 5 on the Switch 2 (shader platform SP_GLSL_SAGE, Yoshi: the global shaders in Engine/GlobalShaderCache-SP_GLSL_SAGE.bin, 335 shader maps of 5,256 shaders, the
+    # materials' in the IoStore container's export data): FShaderMapResourceCode as an i32 count N, N shader hashes (20 bytes each), N again, then N entries of i32 code length,
+    # the code, i32 raw size and u8 frequency. The code is an Oodle block (Unreal Engine 5's default shader compression; Mermaid in the global cache), or the record itself when
+    # Oodle did not make it smaller, and the record a Sage one (uepak.sage: no LSLG, an NVN2 control section). A map is found by its first entry's Oodle header with both counts
+    # in front, and only the entries of a whole map go to the game's decoder: Oodle headers alone matched tables of the export data too, on which the decoder crashed
+    taken = set()
+    def take_sage(s, at):
+        r = uepak.sage(s)
+        if not r: return False
+        ctl, code = r; st = nvn2_stage(ctl, code); taken.add(at)
+        why = 'no stage' if st is None else check(label, st, ctl, code)
+        if why: print(f'[RED] {label}: Sage shader at {at:#x}: {why}; left out', flush=True)
+        else: out.append((f'{label}#UE{at:x}', st, ctl, code))
+        return True
+    u32 = lambda o: int.from_bytes(d[o:o + 4], 'little')
+    for m in OODLE_HEAD.finditer(d, 12):
+        i = m.start(); N = u32(i - 8); h = i - 12 - 20 * N
+        if not 1 <= N <= 100000 or h < 0 or u32(h) != N: continue
+        e, ents = i - 4, []
+        for _ in range(N):
+            n = u32(e)
+            if not 4 <= n <= len(d) - e - 9: break
+            raw, c = u32(e + 4 + n), d[e + 4:e + 6]
+            if not ((c[0] == 0x8c and c[1] in (6, 10, 11, 12) and n < raw) or n == raw) or raw > 64 << 20 or d[e + 8 + n] > 16: break
+            ents.append((e + 4, n, raw)); e += 9 + n
+        if len(ents) < N: continue
+        for at, n, raw in ents:
+            s = d[at:at + n] if n == raw else oodle_try(d[at:at + n], raw)
+            if s is None: print(f'[RED] {label}: the game\'s decoder rejected the shader entry at {at:#x} of a shader map ({n} → {raw} bytes); left out', flush=True)
+            else: take_sage(s, at)
+    for m in re.finditer(re.escape(uepak.NVN2_CTL), d):   # a record stored as it is outside such a map: its length in front of it and again as the raw size after it
+        k = m.start(); nctl = u32(k - 4) if k >= 4 else 0
+        for e in range(k + nctl, min(k + nctl + 33, len(d) - 4)):
+            n = u32(e); st = e - n
+            if 4 <= st <= k and st not in taken and u32(st - 4) == n and take_sage(d[st:e], st): break
+
+OODLE_HEAD = re.compile(b'\x8c[\x06\x0a\x0b\x0c]')   # an Oodle block's header: 0x8c, then the compressor (Kraken, Mermaid, Selkie, Leviathan)
 
 def arh_entries(d):
     """Monolith ARH1 index → (path, ARD offset, stored size). The XOR trie
