@@ -1859,13 +1859,15 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; unsigned up_seq; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take)
+// up_seq: the upload batch (g_up_seq) whose GPU deswizzle fills tex from the pool when the batch runs, 0 when the upload was a CPU snapshot or its batch is closed (pkg_upload_gpu_seq)
 @implementation NvPkg
 - (void)dealloc { res_remove(tex); if (spare) res_remove(spare); free(edge[0]); free(edge[1]); }
 @end
-static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_miss, g_pkg_edge_skips;
+static uint64_t g_pkg_uploads, g_pkg_reuploads, g_pkg_miss, g_pkg_edge_skips, g_pkg_batch_merges;
+static unsigned g_last_up_gpu_seq;   // pkg_upload_: the open batch its GPU deswizzle went into, 0 for a CPU snapshot or a batch flushed at once
 static uint64_t g_pfv_upgrades;
 // DM_NVN_DIRTYCHECK=1 (diagnostic, compared against ground truth): fully hash the pool content on every use; changed but not detected by dirty-page tracking = a missed detection
 static int dirtycheck(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_DIRTYCHECK") != NULL; return v; }
@@ -2300,6 +2302,7 @@ int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uin
 // second texture and a copy of every level for each re-upload, and its spare (of other usage) was never reused
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    g_last_up_gpu_seq = 0;
     id<MTLTexture> r = pkg_upload_(t, stamp, reuse, keep);
     clock_gettime(CLOCK_MONOTONIC, &b); uint64_t d_ = (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + b.tv_nsec - a.tv_nsec);
     atomic_fetch_add(&g_upload_ns, d_); g_up_total_ns += d_;
@@ -2392,7 +2395,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                     if(nvn_deswz_gpu_direct_m4(g_up_ce,g_up_ct,params,poff,(__bridge id<MTLBuffer>)mb,mo,&t->d,l,view)){ok=0;break;}
                     g_direct_dispatches++;
                 }
-                if(ok){[g_up_texs addObject:mt];g_direct_uploads++;if(!g_cb)up_flush();return mt;}
+                if(ok){[g_up_texs addObject:mt];g_direct_uploads++;g_last_up_gpu_seq=g_up_seq;if(!g_cb){up_flush();g_last_up_gpu_seq=0;}return mt;}
                 // Any encoded writes must finish before fallback copies replace
                 // them; both versions read the same source and write all texels.
                 [g_up_ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
@@ -2413,7 +2416,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         if (enc_ok) {
             [g_up_texs addObject:mt];
-            if (!g_cb) up_flush();
+            g_last_up_gpu_seq = g_up_seq;
+            if (!g_cb) { up_flush(); g_last_up_gpu_seq = 0; }
             return mt;
         }
         g_nup_blits = nb0;   // Roll back the copies already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
@@ -2771,6 +2775,13 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
                 return pk->view ? pk->view : pk->tex;
             }
             if (!pk->sparse && pkg_edges_clean(pk, t)) return pk->view ? pk->view : pk->tex;   // only the pages it shares with other data were written
+            // Written again while its last upload still waits in the open batch: that upload's GPU deswizzle reads the pool when the batch runs, before every draw of this
+            // submission, so it takes these writes too; another texture would hold the same bytes. Star Fox's texture streamer writes its 512x512x128 BC array (43 MB) between
+            // draws: 30 whole re-uploads, 30 new textures, in one frame. The pages are protected again from now, as an upload would have
+            if (!pk->sparse && pk->up_seq && pk->up_seq == g_up_seq && g_up_cb) {
+                pk->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); pk->seen = pk->stamp; g_pkg_batch_merges++;
+                return pk->view ? pk->view : pk->tex;
+            }
             // Pool content changed (streamed assets written into the same storage, a movie frame): switch to another texture, as in-flight draws still read the old one. That is the spare
             // when the GPU is done with it (see NvPkg), else a new one; the old one becomes the spare (pkg_upload_ made nt resident)
             id<MTLTexture> reuse = nil;
@@ -2780,12 +2791,14 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
                 if (pk->sparse) sparse_view(pk, t);
                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
-                pk->spare = old; pk->spare_fence = g_fence + 1; g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); }
+                if (t->L.size >= (16u << 20)) { static uint64_t lser[32]; static int lcnt[32], nl; int k = 0; while (k < nl && lser[k] != t->serial) k++; if (k == nl && nl < 32) { lser[nl] = t->serial; lcnt[nl++] = 0; } if (k < 32 && lcnt[k]++ < 3) MLOG("re-upload of a large texture: ser=%llu %ux%ux%u levels %u format %#x target %d, %.1f MB, pool %p off %#llx (frame %llu)",
+                    (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, t->L.size / 1048576.0, (void *)t->pool, (unsigned long long)t->off, (unsigned long long)atomic_load(&g_cur_frame)); }
+                pk->spare = old; pk->spare_fence = g_fence + 1; g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; pk->up_seq = g_last_up_gpu_seq; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); }
             return pk->view ? pk->view : pk->tex;
         }
         pk = [NvPkg new];
         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
-        pk->tex = pkg_upload(t, &pk->stamp, nil, 0);
+        pk->tex = pkg_upload(t, &pk->stamp, nil, 0); pk->up_seq = g_last_up_gpu_seq;
         if (!pk->tex) return nil;
         pk->span = nvn_dirty_span(t->mem, t->L.size);
         pk->seen = pk->stamp; g_pkg_uploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);   // "nothing written since" starts at the stamp: a write that faulted during the upload moved "now" past it
@@ -2887,6 +2900,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
         MLOG("GPU allocation growth by op: op%d %llu MB, op%d %llu MB, op%d %llu MB, op%d %llu MB", top[0], g_ap_bytes[top[0]] >> 20, top[1], g_ap_bytes[top[1]] >> 20, top[2], g_ap_bytes[top[2]] >> 20, top[3], g_ap_bytes[top[3]] >> 20); }
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
+uint64_t mtl_pkg_batch_merges(void) { return g_pkg_batch_merges; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 void mtl_vc_drop(uint64_t ser);
@@ -11181,7 +11195,8 @@ static void dlss_eval(const p_dlss *c) {
     zskip_del(c->tex[DLSS_OUTPUT]->serial);
     NSUInteger iw = c->iw > 0 ? (NSUInteger)c->iw : col.width, ih = c->ih > 0 ? (NSUInteger)c->ih : col.height;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    dlss_scaler *e = dep && mot ? dlss_scaler_for(c, col, dep, mot, out, iw, ih) : NULL;
+    static int fx_on = -1; if (fx_on < 0) { const char *ev = getenv("DM_NVN_DLSS_METALFX"); fx_on = !(ev && !strcmp(ev, "0")); if (!fx_on) MLOG("DLSS: DM_NVN_DLSS_METALFX=0, the bilinear stand-in instead of MetalFX"); }
+    dlss_scaler *e = fx_on && dep && mot ? dlss_scaler_for(c, col, dep, mot, out, iw, ih) : NULL;
     if (!e) {
         NVNcopyRegion sr = {c->base[DLSS_COLOR][0], c->base[DLSS_COLOR][1], 0, (int)iw, (int)ih, 1}, dr = {c->base[DLSS_OUTPUT][0], c->base[DLSS_OUTPUT][1], 0, (int)out.width, (int)out.height, 1};
         if (!(out.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(out.pixelFormat) && !fmt_int_or_ds(out.pixelFormat)) out = tex_upgrade(c->tex[DLSS_OUTPUT], out, MTLTextureUsageRenderTarget, out.pixelFormat);
