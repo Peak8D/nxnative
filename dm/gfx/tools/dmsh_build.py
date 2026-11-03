@@ -525,7 +525,9 @@ def job_for(key, name, rec, w):
         # compute lays out its driver constants in c[0] per shader: the control section gives its push constants' words (+0xa9), counts its uniform buffer, storage
         # buffer and texture entries (+0xb1, +0xb2, +0xb3) and gives the size (+0xba); the translator maps them to c[24] and NVN's fixed tables (InstEmitAmpere.cs
         # AMapC0). Graphics keeps NVN's tables
-        if stage == 'cs': extra['nvn2_cs'] = [rec[ci + 0xb1], rec[ci + 0xb2], rec[ci + 0xb3], struct.unpack_from('<H', rec, ci + 0xba)[0], rec[ci + 0xa9] * 4]
+        # then (+0xb4, +0xb5, +0xb6) its separate texture, separate sampler and image entries, which follow the textures in that order (Fast Fusion: all 65 of its
+        # compute shaders' layouts add up to +0xba; noiseworley3d's only entry is the image its SUST writes)
+        if stage == 'cs': extra['nvn2_cs'] = [rec[ci + 0xb1], rec[ci + 0xb2], rec[ci + 0xb3], struct.unpack_from('<H', rec, ci + 0xba)[0], rec[ci + 0xa9] * 4, rec[ci + 0xb4], rec[ci + 0xb5], rec[ci + 0xb6]]
         if stage in ('ts', 'ms'):
             # A task / mesh shader (control +0x56 6 / 7): translated as compute, its SPH taken off, its stage memory in shared memory (dmsh_meshstage.py); the control section
             # gives its workgroup's threads (+0x58), its payload's bytes (+0x5a) and a mesh shader's most vertices and primitives (+0x60, +0x62)
@@ -710,7 +712,7 @@ def decode_ubo_tex(name):
     if not 3 <= tb <= 16 or ty not in (0, 1, 3) or (ty == 1 and not 3 <= sb <= 16): return None
     return (tb - 3, o0 * 4), (('id', o1) if ty == 3 else (sb - 3, o1 * 4) if ty else (tb - 3, o0 * 4))
 
-def c2_array(name, ty):
+def c2_array(name, ty, layout=None):
     """An array of handles in the driver table c2 that the shader indexes at run time (Ryujinx's texture array from a buffer, here bank 2: <stage>_t<type>_cb<slots>_<handle>, declared
     array<element, n>, one element per c2 handle word; the index is the handle's byte offset ÷ 8). Luigi's Mansion 3: 586 pixel shaders sample their shadow cascades from
     array<texture2d_array<float>, n> fp_t2das_cb2_0, the index (0x80 + a cascade offset) ÷ 8. Handle type 1 ORs one fixed separate sampler word into every element's handle:
@@ -721,6 +723,15 @@ def c2_array(name, ty):
     slots, h = int(m.group(1)), int(m.group(2), 16)
     if h >> 28 == 0 and slots == 2: return (h & 0x3fff) * 4, None
     if h >> 28 == 1 and slots & 0xffff == 2 and (slots >> 16) - 1 == 2: return (h & 0x3fff) * 4, ((h >> 14) & 0x3fff) * 4
+    # NVN2 compute: the texture handles are in c0's per-shader layout (job nvn2_cs, InstEmitAmpere.cs AMapC0), from 0x10 + push + 0x10 per uniform and storage slot. An array the shader
+    # indexes there at run time is the same array over c2's texture table, shifted to where AMapC0 maps that layout's first handle (Fast Fusion's volumetricfog: its shadow cascades,
+    # cp_t2d_cb196608_10140000, the handles from c0 + 0x20 and its separate sampler's word)
+    if layout and len(layout) >= 5 and slots & 0xffff == 0 and h >> 28 in (0, 1):
+        hb = 0x10 + ((layout[4] + 0xf) & ~0xf) + 0x10 * (layout[0] + layout[1])
+        off = 0x20 + (h & 0x3fff) * 4 - hb
+        if off < 0: return None
+        if h >> 28 == 0: return off, None
+        if (slots >> 16) - 1 == 2: return off, ((h >> 14) & 0x3fff) * 4
     return None
 
 POOL_MIN = 33   # arrays at least this long are pools: Program.cs sizes Ryujinx's handle fallback by the pools, the vendored BindlessElimination keeps 32-entry slot arrays (NvnSlotArrayLength)
@@ -768,7 +779,7 @@ def pool_arrays(src):
         if left: raise ValueError(f'{nm}: {left} uses of the pool array the rewrite does not cover')
     return src
 
-def reflect(key, stage, msl, res):
+def reflect(key, stage, msl, res, layout=None):
     """MSL argument buffer struct member → replay reflection: kind (same as nvn_refl.h) + NVN slot number + argument buffer member index"""
     body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
     sb_cb = {b['binding']: b for b in res['sbufs']}
@@ -797,8 +808,8 @@ def reflect(key, stage, msl, res):
             if nm.endswith('Smplr'): e.update(kind=abi.KIND_SAMP_ID, reg=us[1]) if us[0] == 'id' else e.update(kind=abi.KIND_SAMP_UBO, reg=us[0], off=us[1])
             elif 'texture_buffer' in ty: e.update(kind=abi.KIND_UNKNOWN)   # bindless typed buffer: not implemented in the replay layer
             else: e.update(kind=abi.KIND_TEX_UBO, reg=ut[0], off=ut[1])
-        elif c2_array(nm, ty) is not None:   # an array of the driver table's handles (c2_array): the replay fills element k from the slot whose c2 word is at off + 8k
-            off, soff = c2_array(nm, ty)   # pyright: ignore[reportGeneralTypeIssues]  (not None: tested above)
+        elif c2_array(nm, ty, layout) is not None:   # an array of the driver table's handles (c2_array): the replay fills element k from the slot whose c2 word is at off + 8k
+            off, soff = c2_array(nm, ty, layout)   # pyright: ignore[reportGeneralTypeIssues]  (not None: tested above)
             e.update(kind=abi.KIND_SAMP_C2A if nm.endswith('Smplr') else abi.KIND_TEX_C2A, off=off, **({'soff': soff} if soff is not None else {}))
         elif nm.endswith('Smplr'):   # handle type 0 = texture and sampler combined in one handle: the sampler index is taken from the high bits of that texture slot's handle
             t, s, ty = decode_tex(nm[:-5]); e.update(kind=abi.KIND_SAMP_ID, reg=const_sampler(nm[:-5])) if ty == 3 else e.update(kind=abi.KIND_SAMP, reg=s) if ty else e.update(kind=abi.KIND_SAMP_TEX, reg=t)
@@ -1281,7 +1292,7 @@ def finish(key, w, j, c1):
     clone(msl, os.path.join(out, key + '_b.metal'))
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
-    try: binds = reflect(key, j['mesh_stage']['kind'] if j.get('mesh_stage') else j['stage'], src, res)
+    try: binds = reflect(key, j['mesh_stage']['kind'] if j.get('mesh_stage') else j['stage'], src, res, j.get('nvn2_cs'))
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),

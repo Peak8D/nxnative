@@ -286,7 +286,31 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 return (2, 0x20 + (offset - hb));
             }
 
-            if (offset >= ib && offset < size)
+            // with the counts at control +0xb4..+0xb6 (layout 5..7): the separate textures, then the separate samplers, then the images (Fast Fusion: noiseworley3d's one image
+            // at 0x10 with no textures, volumetricfog's four separate textures, its sampler at 0x60 and its image at 0x68), each to NVN's table: 0x168, 0x568, 0x120
+            if (layout.Length >= 8)
+            {
+                int ss = hb + 8 * textures;
+                int sm = ss + 8 * layout[5];
+                int im = sm + 8 * layout[6];
+                int end = im + 8 * layout[7];
+
+                if (offset >= ss && offset < sm)
+                {
+                    return (2, 0x168 + (offset - ss));
+                }
+
+                if (offset >= sm && offset < im)
+                {
+                    return (2, 0x568 + (offset - sm));
+                }
+
+                if (offset >= im && offset < end)
+                {
+                    return (2, 0x120 + (offset - im));
+                }
+            }
+            else if (offset >= ib && offset < size)
             {
                 return (2, 0x120 + (offset - ib));
             }

@@ -431,6 +431,15 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                 op.Emitter?.Invoke(context);
 
+                // A fixed-latency write to a register that a deferred write is still pending for: the register takes it at once (later reads see it), and so does the
+                // pending value, inside this instruction's guard, so that the commit does not bring back what the register held before. The two are written under
+                // exclusive guards (Fast Fusion's UI shader: @P1 TEX R0..R3, then @!P1 MOV R0..R3, 1.0 with no wait): committed after the MOVs, the TEX's pending
+                // value (the registers' old content when P1 was false) left untextured quads black instead of white
+                if (writeBarrier >= 6 && !op.Props.HasFlag(InstProps.Bra))
+                {
+                    RefreshPendingAmpere(context, opStart, pending);
+                }
+
                 if (predSkipLbl != null)
                 {
                     context.MarkLabel(predSkipLbl);
@@ -443,6 +452,47 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
 
             CommitAll();
+        }
+
+        // The registers the operations from opStart on wrote that have a deferred write pending: that pending value becomes the register's new value as well
+        private static void RefreshPendingAmpere(EmitterContext context, int opStart, List<(Register Reg, Operand Value)>[] pendingAll)
+        {
+            int end = context.OperationsCount;
+            HashSet<Register> written = new();
+
+            for (int i = opStart; i < end; i++)
+            {
+                Operation operation = context.GetOperation(i);
+
+                for (int d = 0; d < operation.DestsCount; d++)
+                {
+                    Operand dest = operation.GetDest(d);
+
+                    if (dest != null && dest.Type == OperandType.Register)
+                    {
+                        written.Add(dest.GetRegister());
+                    }
+                }
+            }
+
+            foreach (Register reg in written)
+            {
+                foreach (List<(Register Reg, Operand Value)> list in pendingAll)
+                {
+                    if (list == null)
+                    {
+                        continue;
+                    }
+
+                    foreach ((Register r, Operand v) in list)
+                    {
+                        if (r.Equals(reg))
+                        {
+                            context.Copy(v, Register(reg));
+                        }
+                    }
+                }
+            }
         }
 
         // The registers written by the operations from opStart on become shadow registers (every use in the range too), each first set to the register's value
@@ -484,9 +534,23 @@ namespace Ryujinx.Graphics.Shader.Translation
                 return;
             }
 
+            // Sources read the register's committed value until the instruction itself has written it (the reads of an instruction that does not wait on
+            // a barrier see the old value); after that, the local
+            HashSet<Register> written = new();
+
             for (int i = opStart; i < end; i++)
             {
                 Operation operation = context.GetOperation(i);
+
+                for (int s = 0; s < operation.SourcesCount; s++)
+                {
+                    Operand src = operation.GetSource(s);
+
+                    if (src != null && src.Type == OperandType.Register && written.Contains(src.GetRegister()) && locals.TryGetValue(src.GetRegister(), out Operand local))
+                    {
+                        operation.SetSource(s, local);
+                    }
+                }
 
                 for (int d = 0; d < operation.DestsCount; d++)
                 {
@@ -495,16 +559,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                     if (dest != null && dest.Type == OperandType.Register && locals.TryGetValue(dest.GetRegister(), out Operand local))
                     {
                         operation.SetDest(d, local);
-                    }
-                }
-
-                for (int s = 0; s < operation.SourcesCount; s++)
-                {
-                    Operand src = operation.GetSource(s);
-
-                    if (src != null && src.Type == OperandType.Register && locals.TryGetValue(src.GetRegister(), out Operand local))
-                    {
-                        operation.SetSource(s, local);
+                        written.Add(dest.GetRegister());
                     }
                 }
             }
@@ -513,9 +568,12 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             foreach ((Register reg, Operand local) in locals)
             {
-                context.InsertOperation(at++, new Operation(Instruction.Copy, local, Register(reg)));
+                // A register written again before its earlier deferred write landed: the later write wins, so the earlier one leaves the pending lists. The
+                // local starts as that earlier result, not as the register: when the later write does not happen (its guard is false) or covers only some
+                // paths, the register still gets the earlier result, as on the GPU, where the writes land in order. Fast Fusion's tone mapping: TEX R0..R3,
+                // then @!P0 TEX R1 (green, offset for chromatic aberration) with no wait between; starting from R1 gave green 0 whenever the guard was false
+                Operand start = null;
 
-                // A register written again before its earlier deferred write landed: the later write wins, the earlier shadow is free
                 foreach (List<(Register Reg, Operand Value)> list in pendingAll)
                 {
                     if (list == null)
@@ -525,12 +583,14 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                     foreach ((Register r, Operand v) in list.FindAll(p => p.Reg.Equals(reg)))
                     {
+                        start = v;
                         freeShadows.Push(v.GetRegister().Index);
                     }
 
                     list.RemoveAll(p => p.Reg.Equals(reg));
                 }
 
+                context.InsertOperation(at++, new Operation(Instruction.Copy, local, start ?? Register(reg)));
                 pending.Add((reg, local));
             }
         }

@@ -763,6 +763,8 @@ NVN(nvnQueueBuilderSetDefaults, void, NVNqueueBuilder *b) {
     NVNdevice *dev = QB(b)->dev; memset(b, 0, sizeof(queue_builder_t)); QB(b)->dev = dev;
     QB(b)->cmd_sz = 65536; QB(b)->comp_sz = 262144; QB(b)->ctl_sz = 16384; QB(b)->flush = 4096;   // Device defaults
 }
+// NVN2: a queue may name a primary queue it works beside. The host has one Metal queue order, so nothing to keep
+NVN_NOPROTO(nvnQueueBuilderGetPrimaryQueue, NVNqueue *, const NVNqueueBuilder *b) { (void)b; return NULL; }
 NVN(nvnQueueBuilderSetDevice, void, NVNqueueBuilder *b, NVNdevice *d) { QB(b)->dev = d; }
 NVN(nvnQueueBuilderSetFlags, void, NVNqueueBuilder *b, int f) { QB(b)->flags = f; }
 NVN(nvnQueueBuilderSetCommandMemorySize, void, NVNqueueBuilder *b, size_t n) { QB(b)->cmd_sz = n; }
@@ -1045,7 +1047,13 @@ NVN(nvnCommandBufferBindMultisampleState, void, NVNcommandBuffer *c, const NVNmu
 NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygonState *st) { bind_state(c, 4, st, sizeof(poly_st)); }
 NVN(nvnCommandBufferBindDepthStencilState, void, NVNcommandBuffer *c, const NVNdepthStencilState *st) { bind_state(c, 5, st, sizeof(ds_st)); }
 NVN(nvnCommandBufferBindVertexAttribState, void, NVNcommandBuffer *c, int n, const NVNvertexAttribState *st) {
-    if (n < 0 || n > 16) { LOG("[RED] BindVertexAttribState n=%d", n); return; }
+    if (n < 0 || n > 32) { LOG("[RED] BindVertexAttribState n=%d", n); return; }
+    if (n > 16) {   // Fast Fusion binds all 32 of the hardware's attributes; the host keeps 16, so the rest must be the default state
+        static int once; const uint32_t *w = (const uint32_t *)st;
+        for (int i = 16; i < n; i++) if (w[i] != w[16]) { if (!once++) LOG("[RED] BindVertexAttribState n=%d: attribute %d (%#x) differs from 16 (%#x), beyond the host's 16", n, i, w[i], w[16]); break; }
+        static int noted; if (!noted++) LOG("[nvn] BindVertexAttribState n=%d: attributes 16..%d dropped (attribute 16 is %#x, attribute 0 %#x)", n, n - 1, w[16], w[0]);
+        n = 16;
+    }
     p_bind_vattr *r = RECN(c, OP_BIND_VATTR, p_bind_vattr, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 4 * n);
 }
 NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, const NVNvertexStreamState *st) {
@@ -2488,6 +2496,8 @@ typedef struct { NVNdevice *dev; const NVNshaderData *sd; int n; } prog_builder_
 NVN_NOPROTO(nvnProgramBuilderSetDefaults, void, void *b) { memset(b, 0, sizeof(prog_builder_t)); }
 NVN_NOPROTO(nvnProgramBuilderSetDevice, void, void *b, NVNdevice *d) { ((prog_builder_t *)b)->dev = d; }
 NVN_NOPROTO(nvnProgramBuilderSetShaders, void, void *b, int n, const NVNshaderData *sd) { ((prog_builder_t *)b)->n = n; ((prog_builder_t *)b)->sd = sd; }
+NVN_NOPROTO(nvnProgramBuilderGetDevice, NVNdevice *, const void *b) { return ((const prog_builder_t *)b)->dev; }
+NVN_NOPROTO(nvnProgramBuilderGetShaderCount, int, const void *b) { return ((const prog_builder_t *)b)->n; }
 NVN_NOPROTO(nvnProgramInitializeFromBuilder, NVNboolean, NVNprogram *p, const void *b) {
     const prog_builder_t *o = (const prog_builder_t *)b;
     return h_nvnProgramInitialize(p, o->dev) && (!o->n || h_nvnProgramSetShaders(p, o->n, o->sd));
@@ -2597,6 +2607,10 @@ NVN_NOPROTO(nvnDlssParametersSetJitterOffset, void, dlss_params_t *p, float x, f
 NVN_NOPROTO(nvnDlssParametersSetPreExposure, void, dlss_params_t *p, float e) { p->pre_exposure = e; }
 NVN_NOPROTO(nvnDlssParametersSetHistoryReset, void, dlss_params_t *p, uint32_t on) { p->reset = on & 0xff; }   // an NVNboolean: only its low 8 bits are the guest's
 NVN_NOPROTO(nvnDlssParametersSetEvaluationIndex, void, dlss_params_t *p, int i) { (void)p; (void)i; }   // which of the network's frames in flight: the replay runs them in order
+// DLSS overlay switches (NVN2; Fast Fusion sets both to 0 on every evaluation): whether the network treats the frame as a full-screen overlay and which debug layer it draws. MetalFX has
+// neither; a nonzero value is logged once
+NVN_NOPROTO(nvnDlssParametersSetOverlayFullScreen, void, dlss_params_t *p, uint32_t on) { (void)p; if (on & 0xff) ONCE_LOG("DlssParametersSetOverlayFullScreen %u: no overlay mode on MetalFX", on & 0xff); }
+NVN_NOPROTO(nvnDlssParametersSetOverlayDebugLayer, void, dlss_params_t *p, int layer) { (void)p; if (layer) ONCE_LOG("DlssParametersSetOverlayDebugLayer %d: no debug layers on MetalFX", layer); }
 NVN_NOPROTO(nvnCommandBufferEvaluateDlss, void, NVNcommandBuffer *c, const dlss_net_t *n, const dlss_params_t *p) {
     p_dlss *o = REC_SNAP(c, OP_DLSS, p_dlss, DLSS_TEXTURES);
     for (int k = 0; k < DLSS_TEXTURES; k++) {

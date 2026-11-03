@@ -228,6 +228,34 @@ def ndsr_shaders(d, label):
         elif st == 'ps' and prog: BAHS_VAR[prog] = BAHS_VAR[where] = f'{label}#NDSR#{prog.rsplit("@", 1)[1]}'; prog = None
     return out
 
+def shn_shaders(d, label):
+    """Shin'en's resource files (Fast Fusion): 'SHN!', header length 0x44 at +4, a block at +0x44 of +8 bytes, +0xc decoded (LZ4, or stored when the two are equal: the particle systems, *.w3p) (the tables: 'SHDR' in shaders/*.shdr, 'SCEN' in the
+    models, *.w3d), a raw relocation table at +0x18 (4-byte aligned), and a second block at +0x24, +0x28 bytes, +0x2c decoded. Shaders: the NVN2 control sections in the
+    tables, whose code areas start the second block, one after another in the order of the control sections. A .shdr's second block holds only code; a model's has its
+    meshes after the code (469 models, 6,596 shaders; every one the game loaded in its first race is among them). The textures (.tex) have no control section"""
+    if len(d) < 0x50: return []
+    import lz4.block
+    w = struct.unpack_from('<17I', d)
+    if w[1] != 0x44 or 0x44 + w[2] > len(d): red(f'{label}: SHN! header out of bounds')
+    def block(o, n, u): return d[o:o + n] if n == u else lz4.block.decompress(d[o:o + n], uncompressed_size=u)
+    tab = block(0x44, w[2], w[3])
+    magic = CTL_MAGIC + b'\xc9\0\0\0'
+    if magic not in tab: return []
+    if w[9] + w[10] > len(d): red(f'{label}: SHN! second block out of bounds')
+    code = block(w[9], w[10], w[11])
+    out, at, prog = [], 0, None
+    for m in re.finditer(re.escape(magic), tab):
+        c = m.start(); ctl = tab[c:c + max(struct.unpack_from('<I', tab, c + 0x30)[0], NVN2_KEY_CTL)]
+        n = struct.unpack_from('<I', ctl, 0x44)[0]; k = code[at:at + n]; at += n
+        st = nvn2_stage(ctl, k)
+        if st is None or len(k) != n or (why := check(label, st, ctl, k)): red(f'{label}: SHN! shader @{c:#x}: {why if st else "no stage"}')
+        where = f'{label}#SHN@{c:#x}'
+        out.append((where, st, ctl, k))
+        if st == 'vs': prog = where
+        elif st == 'ps' and prog: BAHS_VAR[prog] = BAHS_VAR[where] = f'{label}#SHN#{prog.rsplit("@", 1)[1]}'; prog = None
+    if tab[:4] == b'SHDR' and at != len(code): red(f'{label}: SHN! code areas {at:#x} of {len(code):#x} bytes')
+    return out
+
 BAHS_VAR = {}   # BAHS entry label → the program variation it belongs to (bahs_variations; var_pairs pairs by it)
 def bahs_variations(d, label, entries):
     """The variations of an agl BAHS file's programs, for var_pairs. The table area holds a binary array (u32 byte size, u32 count, then per binary a record: u32 record size, u32 kind
@@ -2369,6 +2397,7 @@ def scan_blob(d, label, out, depth=0, left=None):
         return
     if d[:4] == b'BAHS': out.extend(bahs_shaders(d, label)); return
     if d[:4] == b'NDSR': out.extend(ndsr_shaders(d, label)); return
+    if d[:4] == b'SHN!': out.extend(shn_shaders(d, label)); return
     if shaders := sead_prim_shaders(d, label): out.extend(shaders); return
     if d[:len(TFXO)] == TFXO: out.extend(tfxo_shaders(d, label)); return
     if d[:4] == b'MSHD': out.extend(mshd_shaders(d, label)); return
@@ -2661,7 +2690,7 @@ def scan_file_in(args):
         try: pairs = unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
         return rel, uniq_keys(found), var_pairs(found) | {(a, b, 'prog') for a, b in pairs}, trees
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] not in (b'MSHD', b'SHN!') and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside

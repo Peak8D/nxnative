@@ -632,9 +632,42 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             AmpereOp x = new(context.CurrOp);
 
-            if (x.Bit(91) || x.Bits(78, 80) != 0)
+            int mode = x.Bits(78, 80);
+
+            if (x.Bit(91) || mode == 1)
             {
                 throw AFail(context, "LDC with a bindless bank or an address mode");
+            }
+
+            // Modes 2 and 3 (.IS / .ISL, segmented): the bank is the instruction's plus Ra's high half, the offset Ra's low half, as Maxwell's LDC.IS (InstEmitMemory.cs Ldc).
+            // Fast Fusion's radeonrays/restructure_bvh reads c[R12.hi][R12.lo] that way
+            if (mode >= 2)
+            {
+                Operand ra = x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr);
+                Operand slot = context.IAdd(Const(x.Bits(54, 59)), context.BitfieldExtractU32(ra, Const(16), Const(16)));
+                Operand addr = context.IAdd(context.BitwiseAnd(ra, Const(0xffff)), Const((int)x.SignedField(38, 54)));
+                int size = x.Bits(73, 76);
+
+                if (size > 5)
+                {
+                    throw AFail(context, $"constant load size {size}");
+                }
+
+                Operand wordOffset = context.ShiftRightU32(addr, Const(2));
+
+                for (int k = 0; k < (size == 5 ? 2 : 1) && x.Rd + k < RegisterConsts.RegisterZeroIndex; k++)
+                {
+                    Operand value = EmitLoadConstant(context, slot, context.IAdd(wordOffset, Const(k)));
+
+                    if (size < 4)
+                    {
+                        value = ExtractSmallInt(context, (LsSize)size, GetBitOffset(context, addr), value);
+                    }
+
+                    context.Copy(Register(x.Rd + k, RegisterType.Gpr), value);
+                }
+
+                return;
             }
 
             if (x.Ra == RegisterConsts.RegisterZeroIndex)

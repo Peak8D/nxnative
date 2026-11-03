@@ -1697,7 +1697,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[152];
+static int g_red_once[154];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2312,7 +2312,7 @@ void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = g_bp_lib_ns; 
 uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // Cumulative texture upload bytes
 // Diagnostic DM_NVN_ZBLOCK=1: all-zero 16-byte blocks of each ASTC texture uploaded on the CPU, per level (an all-zero ASTC block decodes as the error colour, magenta). tex_mtl_ logs
 // a texture whose bound levels hold any (zb_report), with each level's zero blocks, its total and whether all its pages are mapped (sparse pools)
-static int zblock_on(void) { static int v = -1; if (v < 0) { v = getenv("DM_NVN_ZBLOCK") != NULL; if (v) MLOG("DM_NVN_ZBLOCK: counting all-zero blocks of ASTC textures at upload (diagnostic)"); } return v; }
+static int zblock_on(void) { static int v = -1; if (v < 0) { v = getenv("DM_NVN_ZBLOCK") != NULL; if (v) MLOG("DM_NVN_ZBLOCK: counting all-zero blocks of ASTC and 16-byte BC textures at upload (diagnostic)"); } return v; }
 static uint64_t g_zb_ser; static uint32_t g_zb[16], g_zb_tot[16]; static int g_zb_n;
 static void zb_report(const tex_t *t, unsigned base, const char *why) {
     if (!zblock_on() || g_zb_ser != t->serial) return;
@@ -2431,7 +2431,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
     res_add(stg); [g_up_keep addObject:stg];
     size_t off = 0;
-    int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
+    unsigned zf = t->d.format;   // ASTC, and the BC formats of 16-byte blocks (DXT3 / DXT5, RGTC2, BPTC: an all-zero BC6H block decodes black)
+    int zb = zblock_on() && ((zf >= 0x79 && zf <= 0x94) || zf == 0x43 || zf == 0x44 || zf == 0x47 || zf == 0x48 || (zf >= 0x4b && zf <= 0x50)); if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
@@ -4283,6 +4284,7 @@ static int *g_treg_transient; static size_t g_ntreg_transient, g_treg_transient_
 // release write at registration, relaxed atomic read on the reader side, without entering g_rmu (the former h_ser locked and unlocked on every lookup, thousands of times per frame in the camp)
 static _Atomic uint64_t g_tser[1 << 20];
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
+static void **g_sview_r; static uint64_t *g_srid_r;   // a sampler's variant for rectangle views: texel coordinates (normalizedCoordinates NO; samp_rect)
 static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
 // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
 // so a linear texture built directly on a pool kept the whole pool buffer alive (6 to 17 finalized 16 MB pool buffers stayed alive in Engage's title demo). If the ID is still used, the next lookup rebuilds it on the slow path
@@ -4522,10 +4524,13 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     os_unfair_lock_lock(&g_rmu);
     if (id_ >= g_nsreg) { int n = id_ + 256; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); g_sview = realloc(g_sview, n * sizeof *g_sview); g_srid = realloc(g_srid, n * sizeof *g_srid);
         g_sview_w = realloc(g_sview_w, n * sizeof *g_sview_w); g_srid_w = realloc(g_srid_w, n * sizeof *g_srid_w); g_sbk = realloc(g_sbk, n * sizeof *g_sbk);
+        g_sview_r = realloc(g_sview_r, n * sizeof *g_sview_r); g_srid_r = realloc(g_srid_r, n * sizeof *g_srid_r);
+        memset(g_sview_r + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview_r); memset(g_srid_r + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid_r);
         memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); memset(g_sview + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview); memset(g_srid + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid);
         memset(g_sview_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview_w); memset(g_srid_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid_w); g_nsreg = n; }
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
+    if (g_sview_r[id_]) { CFRelease(g_sview_r[id_]); g_sview_r[id_] = NULL; g_srid_r[id_] = 0; }
     g_reg_gen++;
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
     os_unfair_lock_unlock(&g_rmu);
@@ -4814,6 +4819,34 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
         if (t) { g_sview_w[sid] = (void *)CFBridgingRetain(t); g_srid_w[sid] = t.gpuResourceID._impl; memcpy(g_sbk[sid], k, sizeof k); }
         static int nlog; if (nlog++ < 16) MLOG("sampler ID %d: border colour %g,%g,%g,%g, which Metal lacks: Metal colour %d, corrected in the shaders through a twin of colour %d", sid, p.border[0], p.border[1], p.border[2], p.border[3], bn, bw);
     }
+    return s;
+}
+// Rectangle textures (NVN_TEXTURE_TARGET_RECTANGLE, a texture or a view of that target) are addressed in texels, not 0..1: the shaders pass pixel coordinates (Fast Fusion's unlit
+// materials, the sky among them, fade by the scene depth they read at gl_FragCoord through a rectangle view of a depth copy). Metal has that in the sampler (normalizedCoordinates NO),
+// with its limits: no mipmaps, clamp to edge or to zero, no anisotropy, the same min and mag filter, LOD 0. So a draw that samples a rectangle view through a combined handle gets this
+// variant of the handle's sampler. Read through a 0..1 sampler, every pixel coordinate past 1 clamped to the last texel: the whole sky read one ground pixel's depth and faded out
+static int tex_is_rect(int tid) {   // Caller holds g_rmu
+    if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) return 0;
+    const treg_t *r = &g_treg[tid];
+    return r->has_v && r->v.set_target ? r->v.target == NVN_TEXTURE_TARGET_RECTANGLE : r->t.d.target == NVN_TEXTURE_TARGET_RECTANGLE;
+}
+static id<MTLSamplerState> samp_rect(int sid) {   // Caller holds g_rmu
+    if (sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid]) return nil;
+    if (g_sview_r[sid]) return (__bridge id<MTLSamplerState>)g_sview_r[sid];
+    samp_par p = g_sreg[sid];
+    MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+    d.normalizedCoordinates = NO;
+    d.minFilter = d.magFilter = p.magf ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    d.mipFilter = MTLSamplerMipFilterNotMipmapped; d.lodMinClamp = 0; d.lodMaxClamp = 0; d.maxAnisotropy = 1;
+    MTLSamplerAddressMode m[2] = { wrapm(p.ws), wrapm(p.wt) };
+    for (int i = 0; i < 2; i++) if (m[i] != MTLSamplerAddressModeClampToEdge) m[i] = m[i] == MTLSamplerAddressModeClampToBorderColor ? MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToEdge;
+    d.sAddressMode = m[0]; d.tAddressMode = m[1];
+    if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
+    d.supportArgumentBuffers = YES;
+    id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
+    if (s) { g_sview_r[sid] = (void *)CFBridgingRetain(s); g_srid_r[sid] = s.gpuResourceID._impl;
+        static int nlog; if (nlog++ < 4) MLOG("sampler ID %d with a rectangle texture: a texel-coordinate variant (filter %s, address %lu/%lu)", sid, p.magf ? "linear" : "nearest", (unsigned long)m[0], (unsigned long)m[1]); }
+    else RED_ONCE(152, "cannot make the texel-coordinate variant of sampler ID %d for a rectangle texture", sid);
     return s;
 }
 static inline __attribute__((always_inline)) void *samp_fast(int sid) {
@@ -7512,7 +7545,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             int sid = b->kind == NVN_RB_SAMPU ? ubo_samp_id(ubo_handle(nvn_stage, reg, b->off)) :
                       b->kind == NVN_RB_SAMPI ? (int)reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;   // SAMPI: a sampler ID the shader names as a constant
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
-            if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
+            // the texture of the same combined handle a rectangle view (see tex_is_rect): its sampler in texel coordinates
+            int rtid = b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(tex_slot_h(S.tex[nvn_stage], S.img[nvn_stage], reg) & 0xfffff) : 0) : b->kind == NVN_RB_SAMPU ? ubo_tex_id(ubo_handle(nvn_stage, reg, b->off)) : 0;
+            __unsafe_unretained id<MTLSamplerState> sr = ss && rtid && tex_is_rect(rtid) ? samp_rect(sid) : nil;
+            if (sr) { ss = sr; slots[aid] = g_srid_r[sid]; }
+            else if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
                 ss = (__bridge id<MTLSamplerState>)g_sview_w[sid]; slots[aid] = g_srid_w[sid];
                 bmask |= 1u << (b->bw - 1); memcpy(bk[b->bw - 1], g_sbk[sid], sizeof bk[0]);
             } else slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();   // a twin of any other sampler is never sampled
@@ -10858,7 +10895,12 @@ static int fmt_int_or_ds(MTLPixelFormat f) {
         default: return 0;
     }
 }
+static int copy_t2t_draw_m(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int linear, int mirror, MTLColorWriteMask wm);
 static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int linear, int mirror) {
+    return copy_t2t_draw_m(s, d, sl, ss, dl, ds, sr, dr, linear, mirror, MTLColorWriteMaskAll);
+}
+// wm: the colour channels written (the others keep the destination's content, so it is loaded): dlss_alpha writes only alpha
+static int copy_t2t_draw_m(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int linear, int mirror, MTLColorWriteMask wm) {
     static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTLFunction> vf, ff, fd, fds; static id<MTLSamplerState> samp[2]; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss, dss_s; static int failed;
     if (failed || sr->width <= 0 || sr->height <= 0 || dr->width <= 0 || dr->height <= 0) return 0;
     int depth = (s.pixelFormat == MTLPixelFormatDepth32Float || s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) && d.pixelFormat == s.pixelFormat, stencil = depth && d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
@@ -10879,11 +10921,11 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     // Stencil: read through a stencil-only view of the source (one per layer below); without one it is cleared to 0
     id<MTLTexture> stv0 = stencil && s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset, 1)] : nil;
     int scopy = stv0 != nil;
-    NSNumber *pk = @(d.pixelFormat * 2 + scopy);
+    NSNumber *pk = @((d.pixelFormat * 2 + scopy) | (uint64_t)wm << 32);
     id<MTLRenderPipelineState> ps = pso[pk];
     if (!ps) {
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = depth ? (scopy ? fds : fd) : ff;
-        if (depth) { pd.depthAttachmentPixelFormat = d.pixelFormat; if (stencil) pd.stencilAttachmentPixelFormat = d.pixelFormat; } else pd.colorAttachments[0].pixelFormat = d.pixelFormat;
+        if (depth) { pd.depthAttachmentPixelFormat = d.pixelFormat; if (stencil) pd.stencilAttachmentPixelFormat = d.pixelFormat; } else { pd.colorAttachments[0].pixelFormat = d.pixelFormat; pd.colorAttachments[0].writeMask = wm; }
         NSError *e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!ps) { RED_ONCE(83, "format-converting / scaling texture copy: cannot create the pipeline for destination format %lu: %s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
         pso[pk] = ps;
@@ -10902,7 +10944,7 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
         p[4] = dr->xoffset; p[5] = dr->yoffset; p[6] = sw; p[7] = sh;
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         MTLRenderPassAttachmentDescriptor *a = depth ? (MTLRenderPassAttachmentDescriptor *)rp.depthAttachment : (MTLRenderPassAttachmentDescriptor *)rp.colorAttachments[0];
-        int whole = !dr->xoffset && !dr->yoffset && (unsigned)dr->width == dw && (unsigned)dr->height == dh;   // the copy draws every pixel of the level (no blending, no discard): its old content is not loaded (Link's Awakening copies its scene this way every frame)
+        int whole = !dr->xoffset && !dr->yoffset && (unsigned)dr->width == dw && (unsigned)dr->height == dh && (depth || wm == MTLColorWriteMaskAll);   // the copy draws every pixel of the level (no blending, no discard): its old content is not loaded (Link's Awakening copies its scene this way every frame)
         a.texture = d; a.level = dl; a.slice = ds + dr->zoffset + z; a.loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad; a.storeAction = MTLStoreActionStore;
         id<MTLTexture> stv = scopy ? (z ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset + z, 1)] : stv0) : nil;
         if (stencil) { MTLRenderPassStencilAttachmentDescriptor *st = rp.stencilAttachment; st.texture = d; st.level = dl; st.slice = a.slice; st.loadAction = scopy ? (whole ? MTLLoadActionDontCare : MTLLoadActionLoad) : MTLLoadActionClear; st.clearStencil = 0; st.storeAction = MTLStoreActionStore; }
@@ -11130,6 +11172,7 @@ static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLT
               (unsigned long)col.pixelFormat, (unsigned long)dep.pixelFormat, (unsigned long)mot.pixelFormat, (unsigned long)out.pixelFormat);
     return e->sc ? e : NULL;
 }
+static unsigned mtl_pf_chmask(MTLPixelFormat pf);
 static void dlss_eval(const p_dlss *c) {
     rp_flush();   // the passes before it land first: they write its inputs
     id<MTLTexture> col = c->tex[DLSS_COLOR] ? tex_mtl(c->tex[DLSS_COLOR]) : nil, dep = c->tex[DLSS_DEPTH] ? tex_mtl(c->tex[DLSS_DEPTH]) : nil, mot = c->tex[DLSS_MOTION] ? tex_mtl(c->tex[DLSS_MOTION]) : nil,
@@ -11150,6 +11193,8 @@ static void dlss_eval(const p_dlss *c) {
     if ((dep.usage & sc.depthTextureUsage) != sc.depthTextureUsage) dep = tex_upgrade(c->tex[DLSS_DEPTH], dep, sc.depthTextureUsage, dep.pixelFormat);
     if ((mot.usage & sc.motionTextureUsage) != sc.motionTextureUsage) mot = tex_upgrade(c->tex[DLSS_MOTION], mot, sc.motionTextureUsage, mot.pixelFormat);
     if ((out.usage & sc.outputTextureUsage) != sc.outputTextureUsage) out = tex_upgrade(c->tex[DLSS_OUTPUT], out, sc.outputTextureUsage, out.pixelFormat);
+    static int alpha_on = -1; if (alpha_on < 0) { const char *ev = getenv("DM_NVN_DLSS_ALPHA"); alpha_on = !(ev && !strcmp(ev, "0")); }   // the input's alpha drawn into the output after the scaler (below)
+    if (alpha_on && (mtl_pf_chmask(col.pixelFormat) & 0x8) && (mtl_pf_chmask(out.pixelFormat) & 0x8) && !(out.usage & MTLTextureUsageRenderTarget)) out = tex_upgrade(c->tex[DLSS_OUTPUT], out, MTLTextureUsageRenderTarget, out.pixelFormat);
     id<MTLTexture> expo = c->tex[DLSS_EXPOSURE] ? tex_mtl(c->tex[DLSS_EXPOSURE]) : nil;
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // a usage upgrade copies through it
     ubd_land_compute();
@@ -11179,6 +11224,19 @@ static void dlss_eval(const p_dlss *c) {
         sc.reset = reset;
         [sc encodeToCommandBuffer:cb];
     });
+    // MetalFX's temporal scaler writes its output's alpha as 1, where DLSS carries the input's through. Fast Fusion's menus and tutorial pop-ups lay the anti-aliased
+    // scene (DLSS method 2, RGBA16F) over their UI with its alpha: at 1 everywhere, the scene's black background covered the UI. So the input's alpha is drawn into the
+    // output after the scaler, resampled to the output's size (DM_NVN_DLSS_ALPHA=0 leaves MetalFX's)
+    if (alpha_on && (mtl_pf_chmask(col.pixelFormat) & 0x8) && (mtl_pf_chmask(out.pixelFormat) & 0x8)) {
+        id<MTL4ComputeCommandEncoder> be = [g_cb computeCommandEncoder];   // after MetalFX's own encoders
+        [be barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
+        [be barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+        [be endEncoding];
+        NSUInteger ow = out.width - MIN((NSUInteger)c->base[DLSS_OUTPUT][0], out.width), oh = out.height - MIN((NSUInteger)c->base[DLSS_OUTPUT][1], out.height);
+        NVNcopyRegion sr = {c->base[DLSS_COLOR][0], c->base[DLSS_COLOR][1], 0, (int)iw, (int)ih, 1}, dr = {c->base[DLSS_OUTPUT][0], c->base[DLSS_OUTPUT][1], 0, (int)ow, (int)oh, 1};
+        if (!copy_t2t_draw_m(col, out, 0, 0, 0, 0, &sr, &dr, 1, 0, MTLColorWriteMaskAlpha)) RED_ONCE(153, "DLSS: cannot carry the input's alpha into the output (format %lu into %lu)", (unsigned long)col.pixelFormat, (unsigned long)out.pixelFormat);
+        else { static int once; if (!once++) MLOG("DLSS: the input's alpha drawn into the MetalFX output (%lux%lu into %lux%lu)", (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh); }
+    }
     if (c->tex[DLSS_BIAS]) { static int once; if (!once++) MLOG("[RED] DLSS: the game's bias mask (a reactive mask for MetalFX) is not passed on"); }
 }
 

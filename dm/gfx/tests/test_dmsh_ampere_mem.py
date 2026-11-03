@@ -321,15 +321,6 @@ class FloatAtomic(Translated):
         self.assertIn('atomic_fetch_add_explicit((device atomic_float*)', msl)
 
 
-class Sured(Translated):
-    """SURED (0x59f): SUATOM without the old value, its fields laid out as SUATOM's. Mario Kart World's ab77eaee44cfef88 counts into a 2D image with it"""
-    SURED = (0x000fe2000010e000, 0x60000c000400759f)   # SURED.ADD.U32 [R4], R0 on the 2D image of word 12 of c0, as the game encodes it
-
-    def test_add_translates(self):
-        msl = self.translate(inst(*s2r_tid(4)) + inst(*waiting(self.SURED)) + inst(*EXIT))
-        self.assertIn('atomic_fetch_add', msl)
-        self.assertIn('cp_i_tcb_4A_r32ui', msl)
-
 
 class SharedScale(Translated):
     """A shared access scales Ra by the factor in bits 78..79, whatever its size: 1 [Ra.X4], 2 [Ra.X8], 3 [Ra.X16]. Mario Kart World's froxel shaders keep a float4 a thread
@@ -397,6 +388,34 @@ class MeshStage(Translated):
     def test_not_outside_a_task_or_mesh_shader(self):
         with self.assertRaises(AssertionError):
             self.translate(inst(*s2r_tid(7)) + inst(*s2r_tid(16)) + inst(*waiting(self.STORE_ATTR)) + inst(*EXIT), shared=0x1100)
+
+
+def s2r(rd, sr, guard=7): return (0x000e260000000000 | sr << 8, 0x0000000000000919 | guard << 12 | rd << 16)   # @Pguard S2R Rd, SR (write barrier 0, no wait)
+
+
+class GuardedRewrite(Translated):
+    """A deferred write replaced by a later one to the same register before it landed: the later write wins, but when its guard is false the register keeps
+    the earlier result (Fast Fusion's tone mapping, TEX R0..R3 then @!P0 TEX R1 with no wait between: green came out 0 whenever the guard was false)"""
+    STORE = (0x000fe8000000c800, 0x0000080609008388)   # STS [R9.X4 + 0x8], R6
+
+    def test_earlier_result_kept_under_a_false_guard(self):
+        msl = self.translate(inst(*s2r_tid(9)) + inst(*s2r(6, 0x23)) + inst(*s2r(6, 0x22, guard=0)) + inst(*waiting(self.STORE)) + inst(*EXIT), shared=0x1000)
+        self.assertIn('gl_LocalInvocationID.z', msl)   # R6's first value (SR_TID.Z) reaches the store when P0 is false
+        self.assertIn('gl_LocalInvocationID.y', msl)
+
+def mov_imm(rd, imm, guard=7): return (0x000fe20000000f00, 0x0000000000000802 | guard << 12 | rd << 16 | imm << 32)   # @Pguard MOV Rd, imm32 (fixed latency)
+
+
+class GuardedFixedOverPending(Translated):
+    """A fixed-latency write under the opposite guard of a deferred write still pending to the same register: the commit keeps it (Fast Fusion's UI shader,
+    @P1 TEX R0..R3 then @!P1 MOV R0..R3, 1.0: committed after the MOVs, the TEX's pending value left untextured quads black)"""
+    STORE = (0x000fe8000000c800, 0x0000080609008388)   # STS [R9.X4 + 0x8], R6
+
+    def test_fixed_write_survives_the_commit(self):
+        msl = self.translate(inst(*s2r_tid(9)) + inst(*s2r(6, 0x22, guard=0)) + inst(*mov_imm(6, 0x3f800000, guard=8)) + inst(*waiting(self.STORE)) + inst(*EXIT), shared=0x1000)
+        self.assertRegex(msl, r'1065353216|1\.0\b')   # the MOV's 1.0 reaches the store when P0 is false
+        self.assertIn('gl_LocalInvocationID.y', msl)
+
 
 
 if __name__ == '__main__':

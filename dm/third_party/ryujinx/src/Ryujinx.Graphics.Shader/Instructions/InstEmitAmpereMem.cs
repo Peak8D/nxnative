@@ -44,6 +44,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x361, InstName.Tex, ATex, InstProps.Tex);
             x(0xf60, InstName.Tex, ATex, InstProps.Tex);
             x(0xb66, InstName.Tld, ATex, InstProps.Tex);
+            x(0xf66, InstName.Tld, ATex, InstProps.Tex);   // TLD through a handle in a uniform register, as 0xf60 for TEX (Fast Fusion's terrain vertex shaders)
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
             x(0xb69, InstName.Tmml, ATex, InstProps.Tex);
             x(0xb6c, InstName.Txd, ATex, InstProps.Tex);
@@ -129,6 +130,23 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 // task shader's draw-wide task number, the mesh shader's number among its task's launches) and otherwise a word of the payload its task wrote
                 // (mode 0x38, [Ra + offset]). Mario Kart World's grass: the mesh shader reads its blade record at [index * 0x28 + 0x10..0x34]
                 Operand addr = x.Bit(78) ? Const(mesh[0]) : context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const(mesh[1] + (int)x.SignedField(40, 64)));
+
+                if (!x.Bit(78) && x.Bits(72, 80) == 0x34)
+                {
+                    // Mode 0x34: a 16-bit payload entry (Fast Fusion's ship and collectible mesh shaders read a halfword array at [index * 2 + 0x18] that their task
+                    // shaders write with stage output mode 0xb4): its word, shifted down by the half, zero-extended
+                    EmitLoad(context, StorageKind.SharedMemory, LsSize2.B32, context.BitwiseAnd(addr, Const(~3)), x.Rd, 0);
+
+                    if (x.Rd < RegisterConsts.RegisterZeroIndex)
+                    {
+                        Operand rd = Register(x.Rd, RegisterType.Gpr);
+                        Operand half = context.ShiftLeft(context.BitwiseAnd(addr, Const(2)), Const(3));
+                        context.Copy(rd, context.BitwiseAnd(context.ShiftRightU32(rd, half), Const(0xffff)));
+                    }
+
+                    return;
+                }
+
                 EmitLoad(context, StorageKind.SharedMemory, LsSize2.B32, addr, x.Rd, 0);
                 return;
             }
@@ -148,13 +166,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int[] mesh = context.TranslatorContext.GpuAccessor.QueryAmpereMeshLayout();
             int mode = x.Bits(72, 80);
 
-            if (mesh == null || (mode != 0xb8 && mode != 0xf8 && mode != 0x80 && mode != 0x88))
+            if (mesh == null || (mode != 0xb8 && mode != 0xf8 && mode != 0xb4 && mode != 0x80 && mode != 0x88))
             {
                 throw AFail(context, $"stage output store mode {mode:x2} outside a task or mesh shader");
             }
 
-            bool word = mode == 0xb8 || mode == 0xf8;
-            Operand addr = context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const((word ? mesh[2] : mesh[3]) + (int)x.SignedField(40, 64)));
+            bool word = mode == 0xb8 || mode == 0xf8, half = mode == 0xb4;
+            Operand addr = context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const((word || half ? mesh[2] : mesh[3]) + (int)x.SignedField(40, 64)));
 
             if (word)
             {
@@ -162,13 +180,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 return;
             }
 
+            // Mode 0xb4: a 16-bit task payload entry (Fast Fusion: [index * 2 + 0x18], read back by ISBERD mode 0x34), into its word as a byte is below
+            int fill = half ? 0xffff : 0xff;
+
             // A byte: the SPIR-V backend has no 8-bit shared memory, and neighbouring threads write neighbouring bytes of a word, so it goes into its word with
             // two atomics (clear the byte, then set it)
             Operand id = Const(context.ResourceManager.SharedMemoryId);
             Operand wordIndex = context.ShiftRightU32(addr, Const(2));
-            Operand shift = context.ShiftLeft(context.BitwiseAnd(addr, Const(3)), Const(3));
-            Operand value = context.ShiftLeft(context.BitwiseAnd(x.Rb == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr), Const(0xff)), shift);
-            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.And, AtomSize.U32, id, wordIndex, context.BitwiseNot(context.ShiftLeft(Const(0xff), shift)));
+            Operand shift = context.ShiftLeft(context.BitwiseAnd(addr, Const(half ? 2 : 3)), Const(3));
+            Operand value = context.ShiftLeft(context.BitwiseAnd(x.Rb == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr), Const(fill)), shift);
+            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.And, AtomSize.U32, id, wordIndex, context.BitwiseNot(context.ShiftLeft(Const(fill), shift)));
             EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.Or, AtomSize.U32, id, wordIndex, value);
         }
 
@@ -659,9 +680,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
             bool handleInB = opcode == 0x361;
-            bool bindless = handleInB || opcode == 0xf60;
+            bool bindless = handleInB || opcode == 0xf60 || opcode == 0xf66;
 
-            if (opcode == 0xf60)
+            if (opcode == 0xf60 || opcode == 0xf66)
             {
                 int ur = x.Bits(40, 46);
 
@@ -670,7 +691,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = 0xb60;
+                opcode = opcode == 0xf66 ? 0xb66 : 0xb60;
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));
