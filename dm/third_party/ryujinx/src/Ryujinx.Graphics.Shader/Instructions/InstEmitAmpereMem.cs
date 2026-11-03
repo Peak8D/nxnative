@@ -46,8 +46,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0xb66, InstName.Tld, ATex, InstProps.Tex);
             x(0xf66, InstName.Tld, ATex, InstProps.Tex);   // TLD through a handle in a uniform register, as 0xf60 for TEX (Fast Fusion's terrain vertex shaders)
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
+            x(0xf63, InstName.Tld4, ATex, InstProps.Tex);   // TLD4 through a handle in a uniform register, as 0xf60 for TEX (Star Fox's pixel shaders)
             x(0xb69, InstName.Tmml, ATex, InstProps.Tex);
             x(0xb6c, InstName.Txd, ATex, InstProps.Tex);
+            x(0xf6c, InstName.Txd, ATex, InstProps.Tex);   // TXD through a handle in a uniform register, as 0xf60 for TEX (Star Fox: 294 shaders)
             x(0xb6f, InstName.Txq, ATxq, InstProps.Tex);
             x(0x370, InstName.Txq, ATxq, InstProps.Tex);
             x(0xb97, InstName.Suld, ASurface, N);
@@ -529,12 +531,12 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // the value in Rb; 16..24 is not a destination). No encoder documents it: the fields are Eglantine's lowering of the same instruction to Maxwell
         // SURED.ADD.U32 (lower_to_maxwell.h, commit 11a110898f). Only that form is taken: word 2 0x0010e000 is SUATOM's word 2 in Donkey Kong Bananza's
         // encoding less its predicate result (81..84), so ADD (87..91 = 0) of a U32 (73..76 = 0). Mario Kart World's compute shader adds 1 (MOV R0, 1) at the
-        // coordinate in R4 on a 2D image. Another word 2 or handle bank is refused.
+        // coordinate in R4 on a 2D image. The reduction is 87..90 as SUATOM's (Star Fox's compute shaders: word 2 0x0310e000, OR); another word 2 or handle bank is refused.
         public static void ASured(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
 
-            if (x.Bits(64, 96) != 0x0010e000 || x.Bits(59, 61) != 0)
+            if ((x.Bits(64, 96) & ~(0xf << 23)) != 0x0010e000 || x.Bits(87, 91) > (int)RedOp.Xor || x.Bits(59, 61) != 0)
             {
                 throw AFail(context, $"SURED form {x.Bits(64, 96):x8}");
             }
@@ -546,7 +548,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 throw AFail(context, $"SURED handle in bank {cbufSlot}");
             }
 
-            EmitSured(context, (SuDim)x.Bits(61, 64), 0, RedOp.Add, SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false);
+            EmitSured(context, (SuDim)x.Bits(61, 64), 0, (RedOp)x.Bits(87, 91), SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false);
         }
 
         // BAR.SYNC: the workgroup barrier
@@ -680,9 +682,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
             bool handleInB = opcode == 0x361;
-            bool bindless = handleInB || opcode == 0xf60 || opcode == 0xf66;
+            bool bindless = handleInB || opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c;
 
-            if (opcode == 0xf60 || opcode == 0xf66)
+            if (opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c)
             {
                 int ur = x.Bits(40, 46);
 
@@ -691,7 +693,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = opcode == 0xf66 ? 0xb66 : 0xb60;
+                opcode = opcode switch { 0xf63 => 0xb63, 0xf66 => 0xb66, 0xf6c => 0xb6c, _ => 0xb60 };
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));

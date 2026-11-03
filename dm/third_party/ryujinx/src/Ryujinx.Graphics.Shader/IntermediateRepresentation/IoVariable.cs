@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
         Position,
         PrimitiveId,
         SampleId,
+        SampleMask,
         SubgroupEqMask,
         SubgroupGeMask,
         SubgroupGtMask,

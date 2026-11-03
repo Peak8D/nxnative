@@ -68,6 +68,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             alu(0x101, InstName.Flo, ABrev);
             alu(0x0be, InstName.Flo, ABrev, uniform: true);
             alu(0x01a, InstName.Bfe, ASgxt);
+            alu(0x01b, InstName.Bfi, ABmsk);   // BMSK (Star Fox's compute)
             alu(0x09a, InstName.Bfe, ASgxt, uniform: true);
 
             x(0x882, InstName.Mov, AUMov, N, uniform: true);
@@ -75,6 +76,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0xc82, InstName.Mov, AUMov, N, uniform: true);
             x(0x805, InstName.Cs2r, ACs2r, N);
             x(0x919, InstName.S2r, AS2r, N);
+            x(0x925, InstName.Pixld, APixld, N);   // PIXLD (Star Fox's pixel shaders read the coverage mask)
             x(0x9c3, InstName.S2r, AS2r, N, uniform: true);
             x(0x3c2, InstName.Mov, AR2ur, N);
             x(0xab9, InstName.Ldc, AUldc, N, uniform: true);
@@ -1285,6 +1287,54 @@ namespace Ryujinx.Graphics.Shader.Instructions
             res = context.ConditionalSelect(context.ICompareEqual(n, Const(0)), Const(0), res);
 
             ASet(context, x, res, u);
+        }
+
+        // BMSK Rd, pos, width: width one bits from bit pos. .W (75) wraps both to 0..31, else they are clamped to 32: a width of 32 is every bit, a position of 32 none
+        // (NAK OpBMsk; Star Fox's compute shader 58046f286de779e1)
+        public static void ABmsk(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            bool u = AUniform(context);
+            (ASrc a, ASrc b) = ASecond(context, x, u, neg: false, abs: false);
+
+            Operand pos = AGet(context, a), width = AGet(context, b);
+            if (x.Bit(75))
+            {
+                pos = context.BitwiseAnd(pos, Const(31));
+                width = context.BitwiseAnd(width, Const(31));
+            }
+            else
+            {
+                pos = context.IMinimumU32(pos, Const(32));
+                width = context.IMinimumU32(width, Const(32));
+            }
+
+            Operand ones = context.ConditionalSelect(context.ICompareGreaterOrEqualUnsigned(width, Const(32)), Const(-1),
+                context.ISubtract(context.ShiftLeft(Const(1), context.BitwiseAnd(width, Const(31))), Const(1)));
+            Operand res = context.ConditionalSelect(context.ICompareGreaterOrEqualUnsigned(pos, Const(32)), Const(0), context.ShiftLeft(ones, context.BitwiseAnd(pos, Const(31))));
+
+            ASet(context, x, res, u);
+        }
+
+        // PIXLD Rd, value (78..81): per-pixel values of the fragment. MYINDEX (5) is the sample it runs for, COVMASK (1) the samples it covers (the sample mask input). No source
+        // (24..32 zero or RZ), no offset and a PT predicate destination (81..84) are taken; the other values are refused
+        public static void APixld(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            int value = x.Bits(78, 81);
+
+            if (context.TranslatorContext.Definitions.Stage != ShaderStage.Fragment || (x.Ra != 0 && x.Ra != RegisterConsts.RegisterZeroIndex) || x.Bits(32, 64) != 0 ||
+                x.Bits(64, 78) != 0 || x.Bits(81, 84) != RegisterConsts.PredicateTrueIndex || (value != 1 && value != 5))
+            {
+                throw AFail(context, $"PIXLD value {value}");
+            }
+
+            Operand res = value == 5 ? context.Load(StorageKind.Input, IoVariable.SampleId) : context.Load(StorageKind.Input, IoVariable.SampleMask, null, Const(0));
+
+            if (x.Rd != RegisterConsts.RegisterZeroIndex)
+            {
+                context.Copy(Register(x.Rd, RegisterType.Gpr), res);
+            }
         }
 
         // ---- predicates ----

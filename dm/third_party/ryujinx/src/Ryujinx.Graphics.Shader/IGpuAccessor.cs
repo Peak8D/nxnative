@@ -461,6 +461,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: whether a word of the driver's handle table (c[2], at this byte offset) holds a separate sampler's handle, which names no texture
+        /// </summary>
+        /// <param name="byteOffset">Byte offset in c[2]</param>
+        bool QueryC2SamplerWord(int byteOffset)
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Gets the size in bytes of a bound constant buffer for the current shader stage.
         /// </summary>
         /// <param name="slot">The number of the constant buffer to get the size from</param>

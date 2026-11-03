@@ -104,7 +104,12 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             {
                 if (IsTableWord(leaf))
                 {
-                    AddCandidate(found, leaf, null);
+                    // A separate sampler's word alone names no texture: the register holds it on a path that ORs the texture's word in later (Star Fox's terrain pixel
+                    // shaders, c2 0x5c0 loaded before the OR): taken as a texture, the read named a sampler slot, which the shader's load refused (no resolved slot)
+                    if (!gpuAccessor.QueryC2SamplerWord(leaf.GetCbufOffset() * 4))
+                    {
+                        AddCandidate(found, leaf, null);
+                    }
                 }
                 else if (!texOp.Inst.IsImage() && leaf.AsgOp is Operation orOp && orOp.Inst == Instruction.BitwiseOr)
                 {

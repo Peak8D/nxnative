@@ -145,6 +145,7 @@ static class SwshXlate
         public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // the shared memory size in the compute shader's control section (shader_split.py)
         static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, _ => AttributeType.Float };
         public bool QueryGeometryInputFixed() => _job["geometry_topology"] != null;
+        public bool QueryC2SamplerWord(int byteOffset) => byteOffset >= SampBase && byteOffset < SampBase + 8 * 128;   // the separate sampler table (dmsh_abi.h DMSH_C2_SAMP, DMSH_C2_SEP_SLOTS)
         // Compute lowering must emit passthrough vertices explicitly: Metal
         // cannot supply the native NV geometry-passthrough stage afterwards.
         public bool QueryHostSupportsGeometryShaderPassthrough() => _job["geometry_topology"] == null;
