@@ -66,7 +66,9 @@ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
 // IP, or its /24's .255) as unicast to each peer: a Tailscale tailnet carries no L2 broadcast, so a game's LAN discovery
 // rides on this. nifm (below) reports the probed interface with a /24 subnet, which puts a game's directed-broadcast
 // address inside the same patterns.
-int dm_net_online(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NET"); v = e && atoi(e); } return v; }
+// DM_NET unset: the profile's net key (DM_GAME_NET). Star Fox turns it on: its libuv needs a loopback socket pair to start, and offline there are no sockets at all. Loopback
+// sockets offline, as Horizon's bsd service has them without a network, would serve it without a profile key (open)
+int dm_net_online(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NET"); v = e ? atoi(e) != 0 : DM_GAME_NET; } return v; }
 enum { SK_MAX_PEERS = 16 };
 static in_addr_t sk_peers[SK_MAX_PEERS];
 static int sk_npeers = -1;

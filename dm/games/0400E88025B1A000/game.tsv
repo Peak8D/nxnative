@@ -1,0 +1,46 @@
+# Star Fox (Switch 2): the survey's profile (scripts/build_ipa_from_nsp.py, dm/games/profile_guess.py), with the memory layout, net and the resolution cut of the bring-up (README.md)
+
+# ---- Identity ----
+title_id	0400E88025B1A000
+program_id	0400E88025B1A000
+
+# ---- App ----
+name	Star Fox
+ipa	StarFox.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v131072	?	main=a7730d0f74d168d90422354c8317f76f	subsdk0=593524e167fecd3c7a42a184c9da3963	subsdk3=973102ab6bb2be3dc4f0c3a4c9e7e1c4	sdk=41d4de4a3b78214ad20c896960df0e5e
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# not loaded, main takes nothing from them the host does not supply: subsdk1 (C / libc), subsdk2 (NintendoSDK_DLSS)
+modules	main subsdk0 subsdk3 sdk
+romfs_marker	data.zip
+zip_store	.zip:.metallib
+
+# ---- Memory ----
+# the NPDM declares 16 MB of system resource (virtual address memory) and main never sets a heap: the game maps its memory itself. The survey's 5 GB block with a 4.375 GB alias
+# region ran out at the renderer's 3 GB block (vrender_create, Out of memory); an 80 GB block with a 48 GB alias region, as Kirby Air Riders needed
+mem_reserve	0x1400000000
+mem_alias	0xC00000000
+mem_stack	0x10000000
+# the sdk is built for the Switch 2 (spec: Ounce): its 9 GB pool
+app_pool	0x240000000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Network ----
+# its libuv makes a loopback socket pair to start (main+0xbe32700), which the offline socket layer cannot give: real host sockets (README.md, Sockets)
+net	on
+
+# ---- Shader split ----
+shader_groups	/=romfs
+shader_note	Star Fox shaders
+
+# ---- Address region check ----
+# the game calls nvnDeviceSetDepthMode with near = 0 in the check boot: the pipeline bases made before it runs are made for that mode
+depth_mode	zero
+
+# address regions: 2026-11-03, no address regions (rewrite b56c6be9c44f)
