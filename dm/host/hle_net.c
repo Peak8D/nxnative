@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -57,9 +58,10 @@ static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000
 typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
 
 // ---------- DM_NET=1: real sockets (the default stays offline: without the flag every game keeps the behaviour above) ----------
-// The guest descriptor is a host descriptor. Horizon's SockAddr has no sin_len — family u16 at 0 (AF_INET = 2, the host's
-// own number), the port big-endian at 2, the address at 4 — where the host's has sin_len first, so addresses cross through
-// an explicit conversion. PollFd and the fd_set bits match the host's layouts, and the host is BSD, so the errno numbering
+// The guest descriptor is a host descriptor. Horizon's SockAddrIn is FreeBSD's: u8 sin_len at 0, u8 family at 1 (AF_INET = 2, the host's
+// own number), the port big-endian at 2, the address at 4. Addresses cross through an explicit conversion all the same, and a u16 family of 2
+// at 0 (no sin_len) is taken too. Star Fox's libuv (0400E88025B1A000, main+0xbe32700) binds {16, 2, ...}: read as a u16, its family 0x210
+// failed the bind, libuv had no wakeup pair, and its loop polled a watcher without a descriptor and aborted. PollFd and the fd_set bits match the host's layouts, and the host is BSD, so the errno numbering
 // is the guest's. DM_NET_PEERS=ip,ip,… replicates a send to a broadcast-style address (255.255.255.255, the interface's own
 // IP, or its /24's .255) as unicast to each peer: a Tailscale tailnet carries no L2 broadcast, so a game's LAN discovery
 // rides on this. nifm (below) reports the probed interface with a /24 subnet, which puts a game's directed-broadcast
@@ -128,9 +130,9 @@ static void sk_host_addr(struct sockaddr_in *h, const void *g) {   // Horizon So
     memcpy(&h->sin_port, (const char *)g + 2, 2);
     memcpy(&h->sin_addr, (const char *)g + 4, 4);
 }
-static void sk_guest_addr(void *g, unsigned *gl, const struct sockaddr_in *h) {   // and back (family 2, no sin_len)
+static void sk_guest_addr(void *g, unsigned *gl, const struct sockaddr_in *h) {   // and back (sin_len 16, family 2, as Horizon writes them)
     uint8_t o[16] = {0};
-    o[0] = 2;   // AF_INET as the guest's u16 family
+    o[0] = sizeof o; o[1] = 2;   // sin_len, AF_INET
     memcpy(o + 2, &h->sin_port, 2);
     memcpy(o + 4, &h->sin_addr, 4);
     unsigned capacity = gl ? *gl : 0;
@@ -152,7 +154,8 @@ int dm_sk_socket(int fam, int type, int proto) {
     t_skerr = 0; return s;
 }
 static int sk_addr_ok(const void *a, unsigned n, struct sockaddr_in *h) {
-    if (n < 8 || ((const uint16_t *)a)[0] != 2) { t_skerr = 47; return 0; }
+    const uint8_t *b = a;
+    if (n < 8 || !(b[1] == 2 || (b[0] == 2 && b[1] == 0))) { t_skerr = 47; return 0; }   // FreeBSD's u8 family at 1, or a u16 family at 0
     sk_host_addr(h, a); return 1;
 }
 int dm_sk_bind(int s, const void *a, unsigned n) {
@@ -179,7 +182,70 @@ int dm_sk_accept(int s, void *a, unsigned *n) {
     else t_skerr = errno;
     return r;
 }
+
+// Event descriptors (nn::socket::EventFd): the bsd service keeps them itself, network or not, and an engine wakes its own network thread with them. Failed as a socket, Star Fox's
+// (0400E88025B1A000) network library started its wakeup watcher without a descriptor: the watcher's fd field still held a list pointer, the SDK's poll took it for no socket of
+// its own (EFAULT), and the library aborted (main+0xbe2f3a0). Host: each one is a pipe whose read end is the guest's descriptor (so with DM_NET=1 it cannot take a socket's number,
+// and the host's poll sees it), its count kept beside it; the pipe holds one byte while the count is not 0. Reads take the count (or 1 in semaphore mode), writes add to it
+#define SK_EFD_SEMAPHORE 1
+#define SK_EFD_NONBLOCK 4       // EventFdFlags: the flag the eventfd's own read honours
+#define SK_O_NONBLOCK 0x800     // Horizon's O_NONBLOCK (dm_sk_fcntl)
+typedef struct { int fd, wfd, flags; uint64_t v; } sk_efd;
+static sk_efd g_efd[64];
+static pthread_mutex_t g_efd_mu = PTHREAD_MUTEX_INITIALIZER;
+static sk_efd *sk_efd_of(int fd) { if (fd >= 0) for (int i = 0; i < 64; i++) if (g_efd[i].wfd && g_efd[i].fd == fd) return &g_efd[i]; return NULL; }   // under g_efd_mu
+static int sk_is_efd(int fd) { pthread_mutex_lock(&g_efd_mu); int r = sk_efd_of(fd) != NULL; pthread_mutex_unlock(&g_efd_mu); return r; }
+static int sk_efd_new(uint64_t v, int flags) {
+    int p[2]; if (pipe(p)) { t_skerr = errno; return -1; }
+    for (int k = 0; k < 2; k++) { fcntl(p[k], F_SETFL, O_NONBLOCK); fcntl(p[k], F_SETFD, FD_CLOEXEC); }
+    pthread_mutex_lock(&g_efd_mu);
+    for (int i = 0; i < 64; i++) if (!g_efd[i].wfd) {
+        g_efd[i] = (sk_efd){p[0], p[1], flags, v};
+        if (v) (void)!write(p[1], "e", 1);
+        pthread_mutex_unlock(&g_efd_mu); t_skerr = 0; return p[0];
+    }
+    pthread_mutex_unlock(&g_efd_mu); close(p[0]); close(p[1]);
+    LOG("[RED] socket: more than 64 event descriptors"); t_skerr = 24; return -1;   // EMFILE
+}
+static int sk_efd_read(int fd, uint64_t *out) {   // 1 done, 0 not an event descriptor, -1 failed (t_skerr)
+    pthread_mutex_lock(&g_efd_mu);
+    for (;;) {
+        sk_efd *e = sk_efd_of(fd);
+        if (!e) { pthread_mutex_unlock(&g_efd_mu); return 0; }
+        if (e->v) {
+            uint64_t v = e->flags & SK_EFD_SEMAPHORE ? 1 : e->v; e->v -= v; *out = v;
+            if (!e->v) { char b[8]; while (read(e->fd, b, sizeof b) > 0) {} }
+            pthread_mutex_unlock(&g_efd_mu); t_skerr = 0; return 1;
+        }
+        if (e->flags & SK_EFD_NONBLOCK) { pthread_mutex_unlock(&g_efd_mu); t_skerr = 35; return -1; }   // EAGAIN
+        pthread_mutex_unlock(&g_efd_mu);
+        struct pollfd w = {fd, POLLIN, 0}; poll(&w, 1, 100);
+        pthread_mutex_lock(&g_efd_mu);
+    }
+}
+static int sk_efd_write(int fd, uint64_t v) {
+    pthread_mutex_lock(&g_efd_mu);
+    sk_efd *e = sk_efd_of(fd);
+    if (e) { if (v && !e->v) (void)!write(e->wfd, "e", 1); e->v += v; }
+    pthread_mutex_unlock(&g_efd_mu); t_skerr = 0; return e != NULL;
+}
+static int sk_efd_close(int fd) {
+    pthread_mutex_lock(&g_efd_mu);
+    sk_efd *e = sk_efd_of(fd); if (e) { close(e->fd); close(e->wfd); *e = (sk_efd){0}; }
+    pthread_mutex_unlock(&g_efd_mu); return e != NULL;
+}
+static int sk_efd_fcntl(int fd, int c, long a, int *rc) {   // 1 when fd is an event descriptor (*rc the result)
+    pthread_mutex_lock(&g_efd_mu);
+    sk_efd *e = sk_efd_of(fd);
+    if (e) {
+        if (c == 3) *rc = e->flags & SK_EFD_NONBLOCK ? SK_O_NONBLOCK : 0;
+        else if (c == 4) { e->flags = (e->flags & ~SK_EFD_NONBLOCK) | (a & SK_O_NONBLOCK ? SK_EFD_NONBLOCK : 0); *rc = 0; }
+        else *rc = 0;
+    }
+    pthread_mutex_unlock(&g_efd_mu); return e != NULL;
+}
 int dm_sk_close(int s) {
+    if (sk_efd_close(s)) { t_skerr = 0; return 0; }
     if (!dm_net_online()) { t_skerr = SK_ENETDOWN; return -1; }
     int rc = close(s); t_skerr = rc < 0 ? errno : 0; return rc;
 }
@@ -204,6 +270,7 @@ int dm_sk_sockopt(int s, int l, int o, const void *v, unsigned *n, int set) {
     t_skerr = rc < 0 ? errno : 0; return rc;
 }
 int dm_sk_fcntl(int s, int c, long a) {
+    int erc; if (sk_efd_fcntl(s, c, a, &erc)) { t_skerr = 0; return erc; }
     if (!dm_net_online()) { t_skerr = SK_ENETDOWN; return -1; }
     if (c == 3) {   // F_GETFL: O_NONBLOCK is 0x800 on Horizon, 4 here
         int rc = fcntl(s, F_GETFL);
@@ -254,13 +321,23 @@ long dm_sk_recvfrom(int s, void *b, unsigned long n, int f, void *a, unsigned *a
 int dm_sk_last_error(void) { return t_skerr; }
 
 int dm_sk_poll(void *fds, uint64_t n, int ms) {   // also hle_offline.c's plain pollfd form
-    sk_pollfd *p = fds;
-    if (!dm_net_online()) {
-        for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) return sk_fail();
+    sk_pollfd *p = fds; int efds = 0;
+    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) { if (sk_is_efd(p[i].fd)) efds++; else if (!dm_net_online()) return sk_fail(); }   // offline the only descriptors are event ones
+    if (!efds && !dm_net_online()) {
         for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
         return sk_idle(ms);
     }
-    int rc = poll((struct pollfd *)p, (nfds_t)n, ms);   // identical layouts; negative descriptors are ignored as on Horizon
+    // An event descriptor is always writable: asked for, that alone makes the poll return at once (the pipe's read end never reports it)
+    int wr = 0;
+    for (uint64_t i = 0; i < n && efds; i++) if (p[i].fd >= 0 && (p[i].events & POLLOUT) && sk_is_efd(p[i].fd)) wr = 1;
+    int rc = poll((struct pollfd *)p, (nfds_t)n, wr ? 0 : !dm_net_online() && ms < 0 ? 100 : ms);   // identical layouts; negative descriptors are ignored as on Horizon (offline an endless wait returns after 100 ms, as above)
+    if (rc >= 0 && efds) {
+        rc = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            if (p[i].fd >= 0 && (p[i].events & POLLOUT) && sk_is_efd(p[i].fd)) p[i].revents |= POLLOUT;
+            rc += p[i].revents != 0;
+        }
+    }
     t_skerr = rc < 0 ? errno : 0; return rc;
 }
 int dm_sk_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv) {   // fd_set: 1024 bits; timeval: {i64 seconds, i64 microseconds}
@@ -300,9 +377,20 @@ SKF("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", h_sk_SetSockOpt, i
 SKF("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", h_sk_Fcntl, int s, int c, long a) { return dm_sk_fcntl(s, c, a); }
 SKF("_ZN2nn6socket4PollEPNS0_6PollFdEmi", h_sk_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
 SKF("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", h_sk_Select, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
-SKF("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", h_sk_EventFd, unsigned long v, int f) { (void)v; (void)f; return sk_fail(); }
-SKF("_ZN2nn6socket11EventFdReadEiPm", h_sk_EventFdRead, int s, unsigned long *v) { (void)s; (void)v; return sk_fail(); }
-SKF("_ZN2nn6socket12EventFdWriteEim", h_sk_EventFdWrite, int s, unsigned long v) { (void)s; (void)v; return sk_fail(); }
+HLE_FORCE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", "an event descriptor the host keeps (the bsd service's, network or not)", int, h_sk_EventFd, unsigned long v, int f) { return sk_efd_new(v, f); }
+HLE_FORCE("_ZN2nn6socket11EventFdReadEiPm", "takes an event descriptor's count", int, h_sk_EventFdRead, int s, uint64_t *v) { int r = sk_efd_read(s, v); return r > 0 ? 0 : r < 0 ? -1 : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket12EventFdWriteEim", "adds to an event descriptor's count", int, h_sk_EventFdWrite, int s, uint64_t v) { return sk_efd_write(s, v) ? 0 : sk_fail(); }
+// Read and Write: an event descriptor's 8-byte count, as on the bsd service; a socket's data with DM_NET=1; offline they fail like the other socket calls
+HLE_FORCE("_ZN2nn6socket4ReadEiPvm", "an event descriptor's count / DM_NET=1: the host socket's data", long, h_sk_Read, int s, void *b, unsigned long n) {
+    if (sk_is_efd(s)) { uint64_t v; if (n < 8) { t_skerr = 22; return -1; } int r = sk_efd_read(s, &v); if (r > 0) { memcpy(b, &v, 8); return 8; } return -1; }   // EINVAL
+    if (!dm_net_online()) return sk_fail();
+    long r = read(s, b, n); t_skerr = r < 0 ? errno : 0; return r;
+}
+HLE_FORCE("_ZN2nn6socket5WriteEiPKvm", "adds to an event descriptor's count / DM_NET=1: the host socket's data", long, h_sk_Write, int s, const void *b, unsigned long n) {
+    if (sk_is_efd(s)) { uint64_t v; if (n < 8) { t_skerr = 22; return -1; } memcpy(&v, b, 8); sk_efd_write(s, v); return 8; }
+    if (!dm_net_online()) return sk_fail();
+    long r = write(s, b, n); t_skerr = r < 0 ? errno : 0; return r;
+}
 SKF("_ZN2nn6socket17ResolverGetOptionEPNS0_14ResolverOptionENS0_17ResolverOptionKeyE", h_sk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
 SKF("_ZN2nn6socket17ResolverSetOptionERKNS0_14ResolverOptionE", h_sk_ResSet, const void *o) { (void)o; return sk_fail(); }
 HLE_FORCE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", "bsd socket service (offline cut / DM_NET=1: the host's own)", long, h_sk_Recv, int s, void *b, unsigned long n, int f) { return dm_sk_recv(s, b, n, f); }
