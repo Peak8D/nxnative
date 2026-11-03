@@ -1852,6 +1852,7 @@ def ue3_shaders(d, label):
     return out
 
 UE_LEGACY = 'UE legacy pak'
+UE_IOSTORE = 'UE IoStore container'
 def ue_legacy_jobs(files, parts=64):
     """Unreal paks whose shaders are inline in the cooked packages (uepak.inline_shaders): legacy paks (version 4, DRAGON QUEST XI S: pakchunk0-Switch.pak and pakchunk1-Switch.pak, 13.8 GB,
     and the update's *_0_P.pak) and version 11 paks without shader code archives (OCTOPATH TRAVELER II: Majesty-Switch.pak, 3.3 GB). The engine mounts them all as one view, and a patch pak
@@ -1860,19 +1861,31 @@ def ue_legacy_jobs(files, parts=64):
         try: return uepak.inline_shaders(p)
         except (OSError, ValueError, struct.error): return False
     paks = [(p, r) for p, r in files if p.endswith('.pak') and inline(p)]
-    if not paks: return [], set()
+    tocs = [(p, r) for p, r in files if p.endswith('.utoc')]
+    if not paks and not tocs: return [], set()
     view = {}
     for p, r in sorted(paks, key=lambda x: (x[1].endswith('_P.pak'), x[1])):   # patch paks last, so they replace; one view per pak folder (one per version given)
         try:   # all of a pak's names or none: a patch pak read halfway would still replace the base pak's files
             pk = uepak.Pak(p)
             view.update({(os.path.dirname(p), os.path.normpath(pk.mount + name)): (p, r, name, pk.entry(name)['raw']) for name in pk.files})
         except (OSError, ValueError) as e: print(f'[RED] /{r}: the pak cannot be read ({e}); its shaders are left out', flush=True)
-    jobs, cur, size, step = [], collections.defaultdict(list), 0, sum(v[3] for v in view.values()) / parts
+    jobs, cur, size, step = [], collections.defaultdict(list), 0, (sum(v[3] for v in view.values()) / parts) if view else 1
     for p, r, name, raw in sorted(view.values(), key=lambda x: (x[1], x[2])):
         cur[(p, r)].append(name); size += raw
         if size >= step: jobs += [(p_, r_, (UE_LEGACY, tuple(ns))) for (p_, r_), ns in cur.items()]; cur, size = collections.defaultdict(list), 0
-    jobs += [(p_, r_, (UE_LEGACY, tuple(ns))) for (p_, r_), ns in cur.items()]
-    return jobs, {p for p, _ in paks}
+    if cur: jobs += [(p_, r_, (UE_LEGACY, tuple(ns))) for (p_, r_), ns in cur.items()]
+    toc_taken = set()
+    for p, r in tocs:
+        try:
+            tc = uepak.Toc(p)
+            if not tc.encrypted and tc.version < 4:
+                toc_taken.add(p); toc_taken.add(p[:-5] + '.ucas')
+                chunk_step = max(1, len(tc.ids) // parts or 1)
+                for start in range(0, len(tc.ids), chunk_step):
+                    end = min(start + chunk_step, len(tc.ids))
+                    jobs.append((p, r, (UE_IOSTORE, (start, end))))
+        except (OSError, ValueError): pass
+    return jobs, {p for p, _ in paks} | toc_taken
 
 _PAKS = {}
 def ue_legacy_shaders(path, rel, names, out):
@@ -1880,9 +1893,19 @@ def ue_legacy_shaders(path, rel, names, out):
     for the shader records the engine keeps inline"""
     pk = _PAKS.get(path) or _PAKS.setdefault(path, uepak.Pak(path))
     for name in names:
-        d = pk.read(name, decode=oodle)
+        try: d = pk.read(name, decode=oodle)
+        except (OSError, ValueError): continue
         label = re.sub(r"^(\.\./)+", "", os.path.normpath(pk.mount + name))
         ue_inline_shaders(d, f'/{rel}#{label}', out)
+
+_TOCS = {}
+def ue_iostore_shaders(path, rel, chunk_range, out):
+    tc = _TOCS.get(path) or _TOCS.setdefault(path, uepak.Toc(path))
+    start, end = chunk_range
+    for i in range(start, min(end, len(tc.ids))):
+        try: d = tc.read(i)
+        except (OSError, ValueError): continue
+        ue_inline_shaders(d, f'/{rel}#chunk_{i}', out)
 
 ZLIB_HEAD = re.compile(b'\x78[\x01\x5e\x9c\xda]')
 def ue_inline_shaders(d, label, out):
@@ -2567,6 +2590,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == UE_LEGACY:   # files of a legacy Unreal pak (ue_legacy_jobs)
         ue_legacy_shaders(path, rel, args[2][1], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == UE_IOSTORE:   # chunks of an Unreal IoStore container (ue_legacy_jobs)
+        ue_iostore_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == FB_CAS:   # CompiledBytecode resources of a Frostbite cas file (frostbite_jobs)
         frostbite_shaders(path, rel, args[2][1], found)
