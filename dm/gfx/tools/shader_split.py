@@ -256,6 +256,75 @@ def shn_shaders(d, label):
     if tab[:4] == b'SHDR' and at != len(code): red(f'{label}: SHN! code areas {at:#x} of {len(code):#x} bytes')
     return out
 
+GLSLC_MAGIC = b'\x91\x68\x86\x19'
+def viper_shader(d, label):
+    """The Viper engine's shader objects (Star Fox, one member each of its VZIP data.zip): GLSLC's magic 0x19866891, but not a GLSLC output: u32 code length at +4, u32 control
+    length at +8, a u32 at +0xc (0, or 0x48000 on two pixel shaders), an 8-byte hash at +0x10, the code area at +0x18 (Ampere: the 0x80-byte SPH, then instructions), and the NVN2
+    control section right after it, to the end of the object (2,826: 1,480 vertex, 1,298 pixel, 48 compute). One stage each, like a GLSLC output. → [] when it does not fit"""
+    if len(d) < 0x18 + NVN2_KEY_CTL: return []
+    ncode, nctl = struct.unpack_from('<II', d, 4)
+    if 0x18 + ncode + nctl != len(d): return []
+    code, ctl = d[0x18:0x18 + ncode], d[0x18 + ncode:]
+    if not nvn2_ctl(ctl): return []
+    st = nvn2_stage(ctl, code)
+    if st is None or (why := check(label, st, ctl, code)): red(f'{label}: Viper shader object: {why if st else "no stage"}')
+    return [(f'{label}#VIPER@0x0', st, ctl, code)]
+
+def vipr_shaders(d, label):
+    """NVN2 shaders inside the Viper engine's 'VIPR' containers. A record is an 8-byte hash, u32 2, 0, 1, two more u32, then u32 control length, u32 code length and u32 0, then
+    that control section and the code area right after it (Star Fox: 164 compute shaders in one 18.7 MB container). Another container keeps a table of control sections (0xe0
+    bytes apart) with their code areas packed before it in the table's order, each the length its control section names, at no alignment of the file's own (Star Fox's upscaler,
+    28: 8 graphics, 20 compute; its 1536x864 compute pass was missing and the scene with it). The table's code start is the one offset where every area begins as its stage says
+    (vipr_table_base). Control sections neither way places are left out, with a red line"""
+    out, loose = [], []
+    for m in re.finditer(re.escape(CTL_MAGIC + b'\xc9\0\0\0'), d):
+        c = m.start()
+        if c < 0xc or c + NVN2_KEY_CTL > len(d): continue
+        nctl, ncode, z = struct.unpack_from('<III', d, c - 0xc)
+        if z or nctl < NVN2_KEY_CTL or ncode != struct.unpack_from('<I', d, c + 0x44)[0] or c + nctl + ncode > len(d): loose.append(c); continue
+        ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + ncode]
+        st = nvn2_stage(ctl, code)
+        if st is None or check(label, st, ctl, code): loose.append(c); continue
+        out.append((f'{label}#VIPER@{c:#x}', st, ctl, code))
+    left = 0
+    for run in vipr_runs(loose):
+        lens = [struct.unpack_from('<I', d, c + 0x44)[0] for c in run]
+        base = vipr_table_base(d, run, lens)
+        if base is None: left += len(run); continue
+        at = base
+        for c, n in zip(run, lens):
+            ctl, code = d[c:c + (run[1] - run[0] if len(run) > 1 else 0xe0)], d[at:at + n]; at += n
+            st = nvn2_stage(ctl, code)
+            if st is None or check(label, st, ctl, code): left += 1; continue
+            out.append((f'{label}#VIPER@{c:#x}', st, ctl, code))
+    if left: print(f'[RED] {label}: {left} NVN2 control section(s) in a VIPR container whose code area is not found; not split', flush=True)
+    return out
+
+def vipr_runs(cs):   # control sections one stride apart (a table), each run of 2 or more; a lone section is a run of one
+    runs = []
+    for c in cs:
+        if runs and len(runs[-1]) and (len(runs[-1]) == 1 or c - runs[-1][-1] == runs[-1][1] - runs[-1][0]) and c - runs[-1][-1] <= 0x1000: runs[-1].append(c)
+        else: runs.append([c])
+    return runs
+
+def vipr_code_start(code, stage_byte):   # whether a code area begins as its control section's stage says: graphics with their SPH's stage, compute with S2R / S2UR (Star Fox's all do)
+    if len(code) < 8: return False
+    if stage_byte in (0, 1): return sph_stage(bytes(0x30) + code[:4]) == ('vs' if stage_byte == 0 else 'ps')
+    return struct.unpack_from('<I', code, 0)[0] & 0xfff in (0x919, 0x9c3)
+
+def vipr_table_base(d, run, lens):
+    """The offset of a table's first code area: the areas packed in the table's order end before the table, and each begins as its stage says (vipr_code_start); None unless
+    exactly one offset fits"""
+    total, stages = sum(lens), [d[c + 0x56] for c in run]
+    offs = [sum(lens[:k]) for k in range(len(lens))]
+    fits = []
+    for o in range(0, run[0] - total + 1):
+        if not vipr_code_start(d[o:o + 8], stages[0]): continue
+        if all(vipr_code_start(d[o + offs[k]:o + offs[k] + 8], stages[k]) for k in range(1, len(run))):
+            fits.append(o)
+            if len(fits) > 1: return None
+    return fits[0] if fits else None
+
 BAHS_VAR = {}   # BAHS entry label → the program variation it belongs to (bahs_variations; var_pairs pairs by it)
 def bahs_variations(d, label, entries):
     """The variations of an agl BAHS file's programs, for var_pairs. The table area holds a binary array (u32 byte size, u32 count, then per binary a record: u32 record size, u32 kind
@@ -737,15 +806,16 @@ def cpk_shaders(path, rel, ents, out):
             print(f'[RED] /{rel}/{e[0]}: {x}; not scanned', flush=True); continue
         scan_blob(d, f'/{rel}/{e[0]}', out)
 
-ZIP = b'PK\x03\x04'
+ZIP, VZIP = b'PK\x03\x04', b'VZIP'
 def zip_jobs(files, parts=64):
     """Every member of every zip archive in ranges of about equal length (Portal: the whole game in game.zip, 41,416 members, 4.6 GB inflated, Deflate or stored; its GLSLC outputs are the
-    221 nxcontent/nvsb/*.nvsb files, but no name is relied on). → ([(path, rel, (ZIP, members)), …], the zip paths). An archive zipfile cannot read is scanned as one file, as before"""
+    221 nxcontent/nvsb/*.nvsb files, but no name is relied on). The Viper engine's VZIP archives (Star Fox's data.zip: 15.6 GB, 114,154 members, 35.8 GB decoded) are zip files behind an
+    index of their own (vzip_member). → ([(path, rel, (ZIP, members)), …], the zip paths). An archive zipfile cannot read is scanned as one file, as before"""
     import zipfile
     zs = []
     for p, r in files:
         with open(p, 'rb') as f: h = f.read(4)
-        if h != ZIP: continue
+        if h not in (ZIP, VZIP): continue
         try:
             with open(p, 'rb') as source, zipfile.ZipFile(source) as z: zs.append((p, r, [(i.filename, i.file_size) for i in z.infolist() if not i.is_dir()]))
         except (zipfile.BadZipFile, OSError, ValueError) as e: print(f'[RED] /{r}: the zip cannot be read ({e}); scanned as one file', flush=True)
@@ -763,10 +833,34 @@ def zip_shaders(path, rel, names, out):
     GLSLC output of a vertex and a pixel shader)"""
     import zipfile
     with open(path, 'rb') as source, zipfile.ZipFile(source) as z:
+        with open(path, 'rb') as f: vzip = f.read(4) == VZIP
+        info = {i.filename: i for i in z.infolist()} if vzip else {}
         for nm in names:
-            d = z.read(nm); n = len(out)
+            d = vzip_member(source, info[nm], f'/{rel}/{nm}') if vzip else z.read(nm); n = len(out)
             scan_blob(d, f'/{rel}/{nm}', out)
             if len(out) == n and d[:4] != b'MSHD' and b'\x91\x68\x86\x19' in d: out += glslc_shaders(d, f'/{rel}/{nm}', need=False)
+
+def vzip_member(f, i, label):
+    """A member of a VZIP archive (zip_jobs): every member is 'stored' (method 0) with a data descriptor, the local header's sizes are 0xffffffff and the central directory's
+    ZIP64 sizes are right. A member whose stored size is its size is raw (Star Fox's RIFF audio); the others are LZ4 blocks of up to 0x10000 decoded bytes, each a u32 length and
+    the block, each decoded with the 0x10000 bytes before it as its dictionary. The central directory's CRC-32 is that of the decoded member"""
+    import lz4.block
+    f.seek(i.header_offset); h = f.read(30)
+    if h[:4] != ZIP: red(f'{label}: no local file header at {i.header_offset:#x}')
+    nl, el = struct.unpack_from('<HH', h, 26)
+    f.seek(i.header_offset + 30 + nl + el); d = f.read(i.compress_size)
+    if i.compress_type or len(d) != i.compress_size: red(f'{label}: VZIP member with method {i.compress_type}, or truncated')
+    if i.compress_size != i.file_size:
+        out, p = bytearray(), 0
+        while p < len(d):
+            n = int.from_bytes(d[p:p + 4], 'little'); p += 4
+            if p + n > len(d) or len(out) >= i.file_size: red(f'{label}: VZIP LZ4 block of {n:#x} bytes at {p - 4:#x} out of bounds')
+            try: out += lz4.block.decompress(d[p:p + n], uncompressed_size=0x10000, dict=bytes(out[-0x10000:]))
+            except lz4.block.LZ4BlockError as e: red(f'{label}: VZIP LZ4 block at {p - 4:#x}: {e}')
+            p += n
+        d = bytes(out)
+    if len(d) != i.file_size or zlib.crc32(d) != i.CRC: red(f'{label}: VZIP member decodes to {len(d):#x} bytes, CRC {zlib.crc32(d):08x}; the directory says {i.file_size:#x}, {i.CRC:08x}')
+    return d
 
 def pgdat_members(d, label):
     """A PlatinumGames DAT archive: 'DAT\\0', u32 file count, then the offsets of five tables: file offsets (u32 each), extensions (4 bytes each), names (u32 name length, then one name of that
@@ -2398,6 +2492,8 @@ def scan_blob(d, label, out, depth=0, left=None):
     if d[:4] == b'BAHS': out.extend(bahs_shaders(d, label)); return
     if d[:4] == b'NDSR': out.extend(ndsr_shaders(d, label)); return
     if d[:4] == b'SHN!': out.extend(shn_shaders(d, label)); return
+    if d[:4] == GLSLC_MAGIC and (shaders := viper_shader(d, label)): out.extend(shaders); return
+    if d[:4] == b'VIPR': out.extend(vipr_shaders(d, label))
     if shaders := sead_prim_shaders(d, label): out.extend(shaders); return
     if d[:len(TFXO)] == TFXO: out.extend(tfxo_shaders(d, label)); return
     if d[:4] == b'MSHD': out.extend(mshd_shaders(d, label)); return
@@ -2422,8 +2518,10 @@ def group(label):
     return 'other'
 
 def ps_inputs(code):
-    """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
-    return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
+    """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>).
+    The SPH follows NVN's 0x30-byte code header (GFX_MAGIC, which every NVN graphics code area has: check); NVN2 code has none, its SPH is at +0 (nvn2_stage)"""
+    sph = 0x30 if code[:4] == GFX_MAGIC else 0
+    return {i for i in range(32) if struct.unpack_from('<I', code, sph + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
 def pixel_input_cover(shaders):
     """{pixel key: code} → a deterministic greedy cover of their generic inputs; ties take the smaller key."""
@@ -2433,11 +2531,11 @@ def pixel_input_cover(shaders):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return cover
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#VIPER@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # Unreal Engine 3's shader caches (ue3_shaders, '#UE3@'); MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Sumo's Ninty_NX descriptors and NVNsh records, one stage
-# each (Team Sonic Racing: 2,116 vertex and 2,399 pixel programs, sumo_shaders)
+# each (Team Sonic Racing: 2,116 vertex and 2,399 pixel programs, sumo_shaders); the Viper engine's shader objects and VIPR records (Star Fox, viper_shader / vipr_shaders)
 def separable_pairs(keys):
     """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw; Unreal combines its shaders per draw
     from the pipeline state) have their real pairs only at draw time. vs_pad uses only the union of the locations the paired pixel shaders read, so every single-stage vertex shader is paired with
@@ -2593,7 +2691,7 @@ def scan_file_in(args):
     if len(args) > 2 and head[:8] == ONEPACK:   # a range of Trinity packs (trpfs_jobs)
         trinity_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
-    if len(args) > 2 and head[:4] == ZIP and args[2][0] == ZIP:   # members of a zip archive (zip_jobs)
+    if len(args) > 2 and head[:4] in (ZIP, VZIP) and args[2][0] == ZIP:   # members of a zip archive (zip_jobs)
         zip_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == UE_LEGACY:   # files of a legacy Unreal pak (ue_legacy_jobs)
