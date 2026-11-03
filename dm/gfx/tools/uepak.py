@@ -483,7 +483,7 @@ def inline_shaders(path):
         if r.take('<i'): r.take('<QQ'); r.raw(20)
         if not r.take('<i'): return False
         doff, dsz = r.take('<QQ'); d = read_range(f, doff, dsz, path)
-    return b'.ushaderbytecode\0' not in d and b'.uexp\0' in d
+    return b'.ushaderbytecode\0' not in d and (b'.uexp\0' in d or b'GlobalShaderCache' in d)
 
 def unreal_paks(romfs, inline=None):
     """The paks under the RomFS that Unreal wrote (its magic in the footer; inline None = any, True = those whose shaders are inline in the cooked packages, False = the others, inline_shaders):
