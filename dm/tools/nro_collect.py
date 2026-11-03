@@ -30,8 +30,14 @@ def nrr_hashes(romfs, only=None):
             if not f.endswith('.nrr') or (only and f != only): continue
             d = open(os.path.join(dp, f), 'rb').read()
             if d[:4] != b'NRR0': continue
-            off, cnt = struct.unpack_from('<II', d, 0x340)
-            for i in range(cnt): out.setdefault(d[off + 32 * i:off + 32 * i + 32], f)
+            # The Switch 1 NRR keeps (hash-table count, count) at 0x340; the Switch 2 revision keeps them further out (0x4Cx), where the Switch 1 read lands in other data:
+            # a plain 0x340 read of one gave count 0x4df48cf0. Revisions first, then 0x340: the first parse whose (off, cnt) is plausible within the file wins.
+            for o, c in ((0x4C0, 0x4C4), (0x4C4, 0x4C0), (0x340, 0x344)):
+                off = struct.unpack_from('<I', d, o)[0]; cnt = struct.unpack_from('<I', d, c)[0]
+                if 0 < cnt < (1 << 20) and cnt * 32 <= len(d) - off:
+                    for i in range(cnt): out.setdefault(d[off + 32 * i:off + 32 * i + 32], f)
+                    break
+            else: sys.exit(f'{f}: no plausible hash layout ((count, table offset) at 0x340 or 0x4Cx); not a Switch 1 NRR and not the Switch 2 one')
     return out
 
 
@@ -102,6 +108,9 @@ def main():
             p = os.path.join(dp, f); sz = os.path.getsize(p)
             if f.endswith('.nrr') or sz < 0x40: continue
             with open(p, 'rb') as fh: head = fh.read(0x40)
+            if head[:4] == b'CRA.':
+                print(f'[RED] {os.path.relpath(p, romfs)} ({sz >> 30} GB): a CRA. container (a Switch 2 game\'s own archive; its NROs sit inside it, packed by the game\'s format): '
+                      'nro_collect has no reader for this container (see the bring-up docs); the registered NROs it holds are not extracted by this tool')
             if nro_size(head) == sz:
                 body = open(p, 'rb').read(); h = hashlib.sha256(body).digest()
                 if h in want: found[h] = (os.path.relpath(p, romfs), 'loose', body)
