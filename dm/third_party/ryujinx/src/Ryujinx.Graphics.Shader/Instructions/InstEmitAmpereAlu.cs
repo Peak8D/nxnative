@@ -84,6 +84,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x804, InstName.R2p, AR2p, N, writesRd: false);
             x(0x204, InstName.R2p, AR2p, N, writesRd: false);
             x(0x803, InstName.P2r, AP2r, N);
+            x(0x883, InstName.P2r, AUp2ur, N, uniform: true);
             x(0x203, InstName.P2r, AP2r, N);
             x(0x81c, InstName.Psetp, APlop3, N, writesRd: false);
             x(0x89c, InstName.Psetp, APlop3, N, uniform: true, writesRd: false);
@@ -512,6 +513,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             ASet(context, x, context.PackHalf2x16(context.FPSaturate(lo, sat), context.FPSaturate(hi, sat)));
         }
+
 
         public static void AHadd2(EmitterContext context)
         {

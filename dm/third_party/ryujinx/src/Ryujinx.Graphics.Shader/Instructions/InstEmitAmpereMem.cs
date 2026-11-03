@@ -29,13 +29,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x38c, InstName.Atoms, AAtoms, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
             x(0x987, InstName.Stl, AStLocalShared, N, writesRd: false);
             x(0x388, InstName.Sts, AStLocalShared, N, writesRd: false);
             x(0x988, InstName.Sts, AStLocalShared, N, writesRd: false);
-            x(0x38c, InstName.Atoms, AAtoms, N);
             x(0x38d, InstName.Atoms, AAtomsCas, N);
             x(0x992, InstName.Membar, AMembar, N, writesRd: false);
             x(0x9ab, InstName.Membar, AErrbar, N, writesRd: false);
@@ -96,6 +96,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             alu(0x124, InstName.Out, AOut);
             x(0x923, InstName.Isberd, AIsberd, N);
+            x(0x927, InstName.Ast, AStageOut, N, writesRd: false);
             x(0x34e, InstName.Lepc, ALepc, N);
             x(0x357, InstName.Nop, ANop, N, writesRd: false);
             x(0x957, InstName.Nop, ANop, N, writesRd: false);
@@ -120,11 +121,55 @@ namespace Ryujinx.Graphics.Shader.Instructions
         public static void AIsberd(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
+            int[] mesh = context.TranslatorContext.GpuAccessor.QueryAmpereMeshLayout();
+
+            if (mesh != null)
+            {
+                // A task / mesh shader translated as compute (QueryAmpereMeshLayout): ISBERD reads its stage input, the workgroup's index with bit 78 (mode 0x78; the
+                // task shader's draw-wide task number, the mesh shader's number among its task's launches) and otherwise a word of the payload its task wrote
+                // (mode 0x38, [Ra + offset]). Mario Kart World's grass: the mesh shader reads its blade record at [index * 0x28 + 0x10..0x34]
+                Operand addr = x.Bit(78) ? Const(mesh[0]) : context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const(mesh[1] + (int)x.SignedField(40, 64)));
+                EmitLoad(context, StorageKind.SharedMemory, LsSize2.B32, addr, x.Rd, 0);
+                return;
+            }
 
             if (x.Rd < RegisterConsts.RegisterZeroIndex)
             {
                 context.Copy(Register(x.Rd, RegisterType.Gpr), AGpr(x.Ra));
             }
+        }
+
+        // The stage output store of task and mesh shaders (0x927) [Ra + offset], Rb: in shared memory where the build reads it back into the Metal object / mesh
+        // outputs (QueryAmpereMeshLayout). Mode 72..79: 0xb8 a task payload word, 0xf8 a mesh attribute word (vertex attributes component by component, 0x80 bytes
+        // a component for 32 vertices, then the primitive attributes), 0x80 a byte of the primitive indices, 0x88 the primitive count byte (at 3, the indices from 4)
+        public static void AStageOut(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            int[] mesh = context.TranslatorContext.GpuAccessor.QueryAmpereMeshLayout();
+            int mode = x.Bits(72, 80);
+
+            if (mesh == null || (mode != 0xb8 && mode != 0xf8 && mode != 0x80 && mode != 0x88))
+            {
+                throw AFail(context, $"stage output store mode {mode:x2} outside a task or mesh shader");
+            }
+
+            bool word = mode == 0xb8 || mode == 0xf8;
+            Operand addr = context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const((word ? mesh[2] : mesh[3]) + (int)x.SignedField(40, 64)));
+
+            if (word)
+            {
+                EmitStore(context, StorageKind.SharedMemory, LsSize2.B32, addr, x.Rb, 0);
+                return;
+            }
+
+            // A byte: the SPIR-V backend has no 8-bit shared memory, and neighbouring threads write neighbouring bytes of a word, so it goes into its word with
+            // two atomics (clear the byte, then set it)
+            Operand id = Const(context.ResourceManager.SharedMemoryId);
+            Operand wordIndex = context.ShiftRightU32(addr, Const(2));
+            Operand shift = context.ShiftLeft(context.BitwiseAnd(addr, Const(3)), Const(3));
+            Operand value = context.ShiftLeft(context.BitwiseAnd(x.Rb == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr), Const(0xff)), shift);
+            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.And, AtomSize.U32, id, wordIndex, context.BitwiseNot(context.ShiftLeft(Const(0xff), shift)));
+            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.Or, AtomSize.U32, id, wordIndex, value);
         }
 
         public static void ALepc(EmitterContext context)
@@ -879,6 +924,18 @@ namespace Ryujinx.Graphics.Shader.Instructions
                         type = SamplerType.TextureBuffer;
                         sources.RemoveAt(sources.Count - 1);
                         flags &= ~TextureFlags.LodLevel;
+                    }
+                    else if (Sample1DAs2D)
+                    {
+                        // nxnative: as Maxwell's TLDS Texture1DLodZero, the bound descriptor decides between a 1D texture and a texture buffer, and with no type answer
+                        // the fetch is 2D at (x & 0x3FFF, x >> 14): a 1D texture (one row on the host) reads (x, 0) as before, and the host binds a texture buffer in
+                        // the slot as 16384-texel rows (nvn_mtl.m tbuf_as_2d). Pokémon Pokopia's KTGL reads its light and decal lists this way (NVN target 10 in slots
+                        // the shaders declare 1D); bound as is, the 1D slot took a buffer view and the GPU faulted
+                        Operand x0 = sources[0];
+                        sources[0] = context.BitwiseAnd(x0, Const(0x3FFF));
+                        sources.Insert(1, context.ShiftRightU32(x0, Const(14)));
+                        context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle);
+                        type = SamplerType.Texture2D;
                     }
                 }
             }
