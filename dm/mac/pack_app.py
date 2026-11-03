@@ -8,7 +8,8 @@
 # plus AppIcon.icns from the game's icon (sips, iconutil) and the Info.plist keys the launcher reads (DMTitleID, DMRomfsMarker, DMLanguage).
 # The large folders are APFS clones (cp -c) when the app is on the same APFS volume as the build, so they take no space; plain copies otherwise.
 # Signing: the inner host first, then the bundle (codesign --force --sign <identity>; '-' = ad-hoc), without the hardened runtime: the host maps the game's code executable, which the hardened
-# runtime refuses without entitlements, and so the app cannot be notarized.
+# runtime refuses without entitlements, and so the app cannot be notarized. '--sign none' leaves the bundle unsealed: the launcher and the host keep the signature the linker gave
+# them (Apple silicon runs no unsigned code), and macOS does not verify a sealed 20 GB bundle on its first launch ("Verifying…", minutes on a large game) on a Mac that does not assess apps.
 # Usage: pack_app.py <out.app> --host <dmhost> --patched <dir> --romfs <image or dir> --msl <dir> --tables <profile dir> --font <dir> --title-id <id> --name <name> [options]
 #   Reuses <out.app> while <out.app>.key matches; otherwise writes <out.app>.partial and swaps it in at the end. Prints "step: ..." and "app: <path>[, reused (inputs unchanged)]".
 import argparse, ctypes, hashlib, json, os, plistlib, re, shutil, stat, subprocess, sys, tempfile
@@ -270,7 +271,8 @@ def pack(a):
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
-    step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
+    if a.sign == 'none': step('not signed (--sign none): the launcher and the host keep their linker signatures')
+    else: step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
     had_old = out.exists()
     replace_app(tmp, out)
     key_tmp = key_file.with_name(key_file.name + '.partial')
@@ -305,7 +307,7 @@ def parse(argv):
     ap.add_argument('--title-id', required=True); ap.add_argument('--name', required=True)
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
-    ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
+    ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc; none = not signed, the executables keep their linker signatures)')
     return ap.parse_args(argv)
 
 
