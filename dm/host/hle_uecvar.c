@@ -43,20 +43,21 @@ static void pool_tick(void) {
     }
 }
 
-// ue_screen_percentage: r.ScreenPercentage (the scene's size in the upscaler's input) and r.SecondaryScreenPercentage.GameViewport (the upscaler's output in the game's view) held at that
-// percentage. Yoshi and the Mysterious Book sets 50 and 80 at run time (its ini files say 100 for the second), so DLSS made 1536x864 of a 768x432 scene for a 1920x1080 view; with 100
+// ue_screen_percentage <scene> [<output>]: r.ScreenPercentage (the scene's size in the upscaler's input) and r.SecondaryScreenPercentage.GameViewport (the upscaler's output in the game's
+// view) held at those percentages (one value: both). Yoshi and the Mysterious Book sets 50 and 80 at run time (its ini files say 100 for the second), so DLSS made 1536x864 of a 768x432 scene for a 1920x1080 view; with 100
 // and the profile's dlss_native the scene is drawn at 1920x1080 and MetalFX only anti-aliases. Written whenever the game sets a value back; DM_UE_SCREEN_PERCENTAGE overrides (0: the game's)
 static void pct_tick(void) {
-    static int state = -1, nlog; static float target; static uint64_t off[2]; static const char *src;
+    static int state = -1, nlog; static float tg[2]; static uint64_t off[2]; static const char *src;
     static const char *const name[2] = {"r.ScreenPercentage", "r.SecondaryScreenPercentage.GameViewport"};
     if (!state) return;
     if (state < 0) {
         state = 0;
         const char *e = getenv("DM_UE_SCREEN_PERCENTAGE");
-        target = e ? (float)atof(e) : (float)DM_GAME_UE_SCREEN_PERCENTAGE; src = e ? "DM_UE_SCREEN_PERCENTAGE" : "game profile ue_screen_percentage";
-        if (!(target > 0)) return;
-        for (int k = 0; k < 2; k++) if (!(off[k] = dm_ue_cvar(name[k]))) { LOG("[RED] main: Unreal %s not found in main by the rewriter (ue_cvar.py; %s %g not applied)", name[k], src, target); return; }
-        LOG("main: Unreal r.ScreenPercentage and r.SecondaryScreenPercentage.GameViewport held at %g (%s)", target, src);
+        const char *v = e ? e : DM_GAME_UE_SCREEN_PERCENTAGE; char *end; src = e ? "DM_UE_SCREEN_PERCENTAGE" : "game profile ue_screen_percentage";
+        tg[0] = strtof(v, &end); while (*end == ' ' || *end == ',') end++; tg[1] = *end ? strtof(end, NULL) : tg[0];
+        if (!(tg[0] > 0) || !(tg[1] > 0)) return;
+        for (int k = 0; k < 2; k++) if (!(off[k] = dm_ue_cvar(name[k]))) { LOG("[RED] main: Unreal %s not found in main by the rewriter (ue_cvar.py; %s %s not applied)", name[k], src, v); return; }
+        LOG("main: Unreal r.ScreenPercentage held at %g, r.SecondaryScreenPercentage.GameViewport at %g (%s)", tg[0], tg[1], src);
         state = 1;
     }
     uint8_t *base = NULL;
@@ -66,6 +67,7 @@ static void pct_tick(void) {
         if (!rd((uint64_t)(uintptr_t)(base + off[k] + 0x10), &val, sizeof val) || !val) continue;   // not created yet
         for (int c = 0; c < 2; c++) {
             float cur, *p = (float *)(uintptr_t)(val + 4 * (uint64_t)c);
+            float target = tg[k];
             if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur == target) continue;
             uint32_t bits; memcpy(&bits, &target, sizeof bits); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint32_t *)p, bits, __ATOMIC_RELAXED);
             if (nlog < 8) { nlog++; LOG("main: Unreal %s (%s thread) %g → %g (%s)", name[k], c ? "render" : "game", cur, target, src); }

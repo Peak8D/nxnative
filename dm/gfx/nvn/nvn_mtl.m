@@ -11931,7 +11931,7 @@ static void dlss_eval(const p_dlss *c) {
     zskip_del(c->tex[DLSS_OUTPUT]->serial);
     NSUInteger iw = c->iw > 0 ? (NSUInteger)c->iw : col.width, ih = c->ih > 0 ? (NSUInteger)c->ih : col.height;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    static int fx_on = -1; if (fx_on < 0) { const char *ev = getenv("DM_NVN_DLSS_METALFX"); fx_on = !(ev && !strcmp(ev, "0")); if (!fx_on) MLOG("DLSS: DM_NVN_DLSS_METALFX=0, the bilinear stand-in instead of MetalFX"); }
+    static int fx_on = -1; if (fx_on < 0) { const char *ev = getenv("DM_NVN_DLSS_METALFX"); fx_on = ev ? strcmp(ev, "0") != 0 : DM_GAME_DLSS_METALFX; if (!fx_on) MLOG("DLSS: the bilinear stand-in instead of MetalFX (%s)", ev ? "DM_NVN_DLSS_METALFX=0" : "profile dlss_metalfx off"); }
     dlss_scaler *e = fx_on && dep && mot ? dlss_scaler_for(c, col, dep, mot, out, iw, ih) : NULL;
     if (!e) {
         NVNcopyRegion sr = {c->base[DLSS_COLOR][0], c->base[DLSS_COLOR][1], 0, (int)iw, (int)ih, 1}, dr = {c->base[DLSS_OUTPUT][0], c->base[DLSS_OUTPUT][1], 0, (int)out.width, (int)out.height, 1};

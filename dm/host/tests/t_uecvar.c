@@ -27,9 +27,20 @@ static void check_pct(void) {   // ue_screen_percentage: both percentages held, 
     b[0] = 80; dm_ue_cvar_tick(); assert(b[0] == 100 && b[1] == 100 && writes == 5);   // the game set it back
     munmap(base, SIZE);
 }
+static void check_pct2(void) {   // two values: the scene's percentage, then the output's
+    uint8_t *base = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); assert(base != MAP_FAILED);
+    g_nmod = 1; strcpy(g_mod[0].name, "main"); g_mod[0].base = base; g_mod[0].size = SIZE;
+    uint64_t sp = 0x20300, ssp = 0x20400; float a[2] = {50, 50}, b[2] = {80, 80};
+    cvar("r.ScreenPercentage", sp); cvar("r.SecondaryScreenPercentage.GameViewport", ssp);
+    *(uintptr_t *)(base + sp + 0x10) = (uintptr_t)a; *(uintptr_t *)(base + ssp + 0x10) = (uintptr_t)b;
+    setenv("DM_UE_TEXTURE_POOL", "0", 1); setenv("DM_UE_SCREEN_PERCENTAGE", "75 100", 1);
+    dm_ue_cvar_tick(); assert(a[0] == 75 && a[1] == 75 && b[0] == 100 && b[1] == 100 && writes == 4);
+    munmap(base, SIZE);
+}
 
 static void check(int which) {
     if (which == 3) { check_pct(); return; }
+    if (which == 4) { check_pct2(); return; }
     setenv("DM_UE_SCREEN_PERCENTAGE", "0", 1);
     uint8_t *base = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); assert(base != MAP_FAILED);
     g_nmod = 1; strcpy(g_mod[0].name, "main"); g_mod[0].base = base; g_mod[0].size = SIZE;
@@ -52,7 +63,7 @@ static void check(int which) {
 
 int main(void) {
     // Each process starts the one-time lookup with fresh state
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         pid_t p = fork(); assert(p >= 0);
         if (!p) { check(i); _exit(0); }
         int status; assert(waitpid(p, &status, 0) == p); assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

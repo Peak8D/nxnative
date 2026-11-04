@@ -8,7 +8,7 @@ A Switch 2 game: v0 (base), SDK 20.5.15 built for the Switch 2 (`Ounce`), NVN2. 
 |---|---|---|
 | `mem_reserve 0x1028000000`, `mem_alias 0x1000000000`, `mem_stack 0x10000000`, `app_pool 0x240000000` | [`game.tsv`](game.tsv) | Unreal's `nninitStartup` reserves a 62 GB region and its allocator takes 37 GB of it: a 64 GB alias region; the Switch 2's 9 GB pool |
 | `depth_mode zero` | `game.tsv` | the game sets `nvnDeviceSetDepthMode` with near = 0 |
-| `ue_screen_percentage 100`, `dlss_native on` | `game.tsv` | the scene at the view's size: see [Resolution](#resolution) |
+| `dlss_metalfx off` | `game.tsv` | DLSS drawn by the bilinear stand-in: see [Resolution](#resolution) |
 
 The rest of the profile is the survey's (`scripts/build_ipa_from_nsp.py`, `dm/games/profile_guess.py`).
 
@@ -42,7 +42,12 @@ Without `DOTNET_ROOT` every build fails: each key gets a `<key>.demand_failed` a
 
 ## Resolution
 
-The game sets `r.ScreenPercentage` 50 and `r.SecondaryScreenPercentage.GameViewport` 80 at run time (its ini files say 100 for the second; dynamic resolution is off) and asks DLSS for its performance method: a 768x432 scene, made 1536x864 by DLSS and stretched to the 1920x1080 view. Its DLSS plugin asks for every method's optimal input at 1000x1000 and keeps the ratios. With `dlss_native` the host answers with the output's size, and `ue_screen_percentage` holds both percentages at 100: the scene is drawn at 1920x1080 and MetalFX's temporal scaler only anti-aliases. The GPU took about 8 ms a frame at 768x432 and takes about 19 ms at 1920x1080 on an M4 Pro (the first level).
+The game sets `r.ScreenPercentage` 50 and `r.SecondaryScreenPercentage.GameViewport` 80 at run time (its ini files say 100 for the second; dynamic resolution is off) and asks DLSS for its performance method: a 768x432 scene, made 1536x864 by DLSS and stretched to the 1920x1080 view by the game. The profile keeps that and sets `dlss_metalfx off`: the DLSS step is the bilinear stand-in.
+
+Measured on an M4 Pro in the first level:
+- the game's resolution with MetalFX: about 8 ms of GPU time a frame;
+- `ue_screen_percentage 100` with `dlss_native on` (the scene at 1920x1080, MetalFX at 1:1): about 18 ms, so frames missed 60 fps (`PPM_OutlineNew`, the ink outlines, alone took 4.7 ms; the attachments' loads and stores, about 1.35 GB a frame without the TBDR optimizations, which break this game's colours); with the stand-in instead of MetalFX about 16.5 ms, 58 to 60 fps;
+- `ue_screen_percentage 90 100` or `75 100`: the game's DLSS plugin turns itself off below 100 % (no network is made) and the game's own upscale costs more: 22 and 17 ms.
 
 ## Rendering
 
@@ -60,6 +65,7 @@ Holding Plus and Minus skips a cutscene (`DM_KEYS` `Plus+Minus~<seconds>`). `DM_
 ## Open
 
 - The walking flower on the book page did not draw before the attribute 16 fix; not checked since.
+- macOS keeps a bundle it once ran in Game Mode there: with `LSSupportsGameMode` false the Game Overlay's Game Mode switch must be turned off once (docs/reference/frame-rate.md).
 - After play, the save folder holds an empty `Slot00`; saving has not been looked into.
 
 ## Found on this game
