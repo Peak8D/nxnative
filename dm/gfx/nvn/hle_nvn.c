@@ -1057,13 +1057,7 @@ NVN(nvnCommandBufferBindMultisampleState, void, NVNcommandBuffer *c, const NVNmu
 NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygonState *st) { bind_state(c, 4, st, sizeof(poly_st)); }
 NVN(nvnCommandBufferBindDepthStencilState, void, NVNcommandBuffer *c, const NVNdepthStencilState *st) { bind_state(c, 5, st, sizeof(ds_st)); }
 NVN(nvnCommandBufferBindVertexAttribState, void, NVNcommandBuffer *c, int n, const NVNvertexAttribState *st) {
-    if (n < 0 || n > 32) { LOG("[RED] BindVertexAttribState n=%d", n); return; }
-    if (n > 16) {   // Fast Fusion binds all 32 of the hardware's attributes; the host keeps 16, so the rest must be the default state
-        static int once; const uint32_t *w = (const uint32_t *)st;
-        for (int i = 16; i < n; i++) if (w[i] != w[16]) { if (!once++) LOG("[RED] BindVertexAttribState n=%d: attribute %d (%#x) differs from 16 (%#x), beyond the host's 16", n, i, w[i], w[16]); break; }
-        static int noted; if (!noted++) LOG("[nvn] BindVertexAttribState n=%d: attributes 16..%d dropped (attribute 16 is %#x, attribute 0 %#x)", n, n - 1, w[16], w[0]);
-        n = 16;
-    }
+    if (n < 0 || n > NVN_NATTR) { LOG("[RED] BindVertexAttribState n=%d", n); return; }   // all 32 kept: Yoshi's skinned meshes bind 17, their primitive ID offset in attribute 16
     p_bind_vattr *r = RECN(c, OP_BIND_VATTR, p_bind_vattr, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 4 * n);
 }
 NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, const NVNvertexStreamState *st) {
