@@ -1,4 +1,4 @@
-// Unreal console variables found by their registered names, and the texture streaming pool the profile's ue_texture_pool raises.
+// Unreal console variables found by their registered names: the texture streaming pool the profile's ue_texture_pool raises, the screen percentages its ue_screen_percentage holds.
 // The rewriter finds each TAutoConsoleVariable the host may write in main (dm/tools/ue_cvar.py: its static constructor's registration, in any Unreal 4 / 5 build) and names it in main's
 // fixups (UE_CVAR:<name>); the object holds at +0x10 the pointer to the variable's value, the game thread's copy, then the render thread's. Called on every present (hle_nvn.c)
 #include "hle.h"
@@ -18,7 +18,7 @@ uint64_t dm_ue_cvar(const char *name) {
 // device profile sets it (DRAGON QUEST VII Reimagined: 200 on the Switch, 1000 on Windows) and the streaming manager reads it again whenever it changes. The host raises a smaller
 // value the game sets to the target, whenever the game sets it back; a larger one, or -1 (no pool size: the engine sizes its pool otherwise), stays. The profile key applies on the
 // Mac; on iOS only DM_UE_TEXTURE_POOL turns it on (Documents/env.txt), until an iPhone run shows the memory fits. DM_UE_TEXTURE_POOL=0 leaves the game's value
-void dm_ue_cvar_tick(void) {
+static void pool_tick(void) {
     static int state = -1, target, nlog; static uint64_t obj_off; static const char *src;
     if (!state) return;
     if (state < 0) {
@@ -42,3 +42,35 @@ void dm_ue_cvar_tick(void) {
         if (nlog < 8) { nlog++; LOG("main: Unreal r.Streaming.PoolSize (%s thread) %d → %d MB (%s)", c ? "render" : "game", cur, target, src); }
     }
 }
+
+// ue_screen_percentage: r.ScreenPercentage (the scene's size in the upscaler's input) and r.SecondaryScreenPercentage.GameViewport (the upscaler's output in the game's view) held at that
+// percentage. Yoshi and the Mysterious Book sets 50 and 80 at run time (its ini files say 100 for the second), so DLSS made 1536x864 of a 768x432 scene for a 1920x1080 view; with 100
+// and the profile's dlss_native the scene is drawn at 1920x1080 and MetalFX only anti-aliases. Written whenever the game sets a value back; DM_UE_SCREEN_PERCENTAGE overrides (0: the game's)
+static void pct_tick(void) {
+    static int state = -1, nlog; static float target; static uint64_t off[2]; static const char *src;
+    static const char *const name[2] = {"r.ScreenPercentage", "r.SecondaryScreenPercentage.GameViewport"};
+    if (!state) return;
+    if (state < 0) {
+        state = 0;
+        const char *e = getenv("DM_UE_SCREEN_PERCENTAGE");
+        target = e ? (float)atof(e) : (float)DM_GAME_UE_SCREEN_PERCENTAGE; src = e ? "DM_UE_SCREEN_PERCENTAGE" : "game profile ue_screen_percentage";
+        if (!(target > 0)) return;
+        for (int k = 0; k < 2; k++) if (!(off[k] = dm_ue_cvar(name[k]))) { LOG("[RED] main: Unreal %s not found in main by the rewriter (ue_cvar.py; %s %g not applied)", name[k], src, target); return; }
+        LOG("main: Unreal r.ScreenPercentage and r.SecondaryScreenPercentage.GameViewport held at %g (%s)", target, src);
+        state = 1;
+    }
+    uint8_t *base = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) base = g_mod[i].base;
+    for (int k = 0; k < 2 && base; k++) {
+        uint64_t val;
+        if (!rd((uint64_t)(uintptr_t)(base + off[k] + 0x10), &val, sizeof val) || !val) continue;   // not created yet
+        for (int c = 0; c < 2; c++) {
+            float cur, *p = (float *)(uintptr_t)(val + 4 * (uint64_t)c);
+            if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur == target) continue;
+            uint32_t bits; memcpy(&bits, &target, sizeof bits); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint32_t *)p, bits, __ATOMIC_RELAXED);
+            if (nlog < 8) { nlog++; LOG("main: Unreal %s (%s thread) %g → %g (%s)", name[k], c ? "render" : "game", cur, target, src); }
+        }
+    }
+}
+
+void dm_ue_cvar_tick(void) { pool_tick(); pct_tick(); }

@@ -704,6 +704,7 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 
 | Key and value | Games | Binding | Why |
 |---|---|---|---|
+| `dlss_native on` | [Yoshi](../../dm/games/0400245021D2C000/README.md) | `game`, at goal | the game's own resolution, raised past the Switch 2's budget |
 | `enc_thread on` | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | `game` → `host`, gap | what iOS does for every game: a default for every game after `regress.py check` on the games |
 | `game_env DOTNET_GCRegionRange=60000000` | [Absolum](../../dm/games/0100A83022A22000/README.md) | `game`, at goal | measured for the game's regions |
 | `net on` | [Star Fox](../../dm/games/0400E88025B1A000/README.md) | `game` → `host`, gap | libuv needs a loopback socket pair to start; the goal is loopback sockets offline for every game |
@@ -713,6 +714,7 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 | `shader_key_skip 0x7d0+0x18` | [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) | `game`, at goal | the engine shares one control section among shaders; leaving GLSLC's compile information out of every game's keys would change every shader key |
 | `stdalloc_cap 0xa0000000` | [Absolum](../../dm/games/0100A83022A22000/README.md) | `game`, at goal | what the regions after it need, measured by the NSP script's region check; the host's cap is the default |
 | `ue_fps_cvar Project.FrameRateLimit` | [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md) | `game`, at goal | the game's own variable, which its settings apply to t.MaxFPS; the rewriter finds it by name (ue_cvar.py) |
+| `ue_screen_percentage 100` | [Yoshi](../../dm/games/0400245021D2C000/README.md) | `game`, at goal | the game's own resolution, raised past the Switch 2's budget |
 | `ue_texture_pool 1000` | [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) | `game`, at goal | the game's own budget, raised to its Windows value |
 | `vconv_range on` | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | `game` → `host`, gap | the same vertices as the whole range, for less work; DM_NVN_VCONV_CHECK checks it: a default for every game after `regress.py check` on the games |
 | `fps_hold off` | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md), [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | `game`, at goal | the game's pacing |

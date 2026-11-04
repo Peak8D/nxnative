@@ -10,8 +10,9 @@ Usage on its own: ue_cvar.py <module>... (the objects of NAMES in each)"""
 import re, struct, sys, os
 
 # The variables the host may write: the engine's frame limit, its present interval (rhi., or nvn. in the Switch RHI of UE 4.18), the texture streaming pool, and a game's own frame-limit
-# variable a profile names with ue_fps_cvar (SHIN MEGAMI TENSEI V: Vengeance's Project.FrameRateLimit, which its settings apply to t.MaxFPS). A name a profile names must be listed here
-NAMES = ('t.MaxFPS', 'rhi.SyncInterval', 'nvn.SyncInterval', 'r.Streaming.PoolSize', 'Project.FrameRateLimit')
+# variable a profile names with ue_fps_cvar (SHIN MEGAMI TENSEI V: Vengeance's Project.FrameRateLimit, which its settings apply to t.MaxFPS), and the two screen percentages a profile's
+# ue_screen_percentage holds (hle_uecvar.c: Yoshi and the Mysterious Book sets 50 of 80 at run time). A name a profile names must be listed here
+NAMES = ('t.MaxFPS', 'rhi.SyncInterval', 'nvn.SyncInterval', 'r.Streaming.PoolSize', 'Project.FrameRateLimit', 'r.ScreenPercentage', 'r.SecondaryScreenPercentage.GameViewport')
 RET = 0xD65F03C0
 
 def adrp_page(w, pc):

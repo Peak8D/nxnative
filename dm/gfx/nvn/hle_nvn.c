@@ -1720,7 +1720,7 @@ __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c; graphics unit tests 
 __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine frame limits in game memory (Monster Hunter Rise); graphics unit tests have no host
 static int g_engine_stub = 1;   // the weak dm_fps_lock_engine's answer, for graphics unit tests (t_nvn sets it)
 __attribute__((weak)) int dm_fps_lock_engine(void) { return g_engine_stub; }   // hle_fpslock.c: the host writes fps_target into an engine limiter of this main
-__attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
+__attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool and screen percentages (profile ue_texture_pool, ue_screen_percentage)
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c: a movie's pictures are being handed out; graphics unit tests have no movie decoder
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
@@ -2544,9 +2544,13 @@ NVN_NOPROTO(nvnDlssNetworkBuilderSetMaxEvaluationEntries, void, dlss_builder_t *
 NVN_NOPROTO(nvnDlssNetworkBuilderSetTextureIDs, void, dlss_builder_t *b, const void *pool, const int *ids, int n) { (void)b; (void)pool; (void)ids; (void)n; }
 NVN_NOPROTO(nvnDlssNetworkBuilderSetStorage, void, dlss_builder_t *b, void *mem, size_t n) { (void)b; (void)mem; (void)n; }
 NVN_NOPROTO(nvnDlssNetworkBuilderGetStorageSize, size_t, const dlss_builder_t *b) { (void)b; return 0x1000; }   // the scaler keeps its memory on the Mac's side; a page, for a game that allocates what it is told
+// Profile dlss_native on (DM_NVN_DLSS_NATIVE=1 / 0 overrides): the input DLSS asks for is its output's size (DLAA), so a game that renders at the optimal input renders at the size it
+// shows and MetalFX only anti-aliases (at 1:1, as Star Fox's resized network). Yoshi's UE5 asks for every method's input at 1000x1000 and keeps the ratios, with ue_screen_percentage
+static int dlss_native(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DLSS_NATIVE"); v = e ? atoi(e) > 0 : DM_GAME_DLSS_NATIVE; } return v; }
 // The argument order is NGX's NGX_DLSS_GET_OPTIMAL_SETTINGS: optimal, largest and smallest input, sharpness (the game stores them so at main+0x1913cfc). One input size per method: no dynamic range
 NVN_NOPROTO(nvnDlssNetworkBuilderGetOptimalSettings, NVNboolean, const dlss_builder_t *b, int *ow, int *oh, int *maxw, int *maxh, int *minw, int *minh, float *sharp) {
-    int f = dlss_factor(b->method), w = dlss_ceil_div(b->w, f), h = dlss_ceil_div(b->h, f);
+    int f = dlss_native() ? 1 : dlss_factor(b->method), w = dlss_ceil_div(b->w, f), h = dlss_ceil_div(b->h, f);
+    static int nlog; if (nlog < 4) { nlog++; LOG("[nvn] DLSS optimal settings for %dx%d, method %d: input %dx%d%s", b->w, b->h, b->method, w, h, f == 1 && dlss_factor(b->method) != 1 ? " (dlss_native)" : ""); }
     if (ow) *ow = w;
     if (oh) *oh = h;
     if (maxw) *maxw = w;

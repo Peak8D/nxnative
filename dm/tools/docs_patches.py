@@ -122,6 +122,8 @@ SWITCH_BINDING = [
     ('shader_key_skip', '', {'what': 'control-section bytes left out of shader keys', 'now': 'game', 'goal': 'game', 'purpose': 'shaders',
      'why': "the engine shares one control section among shaders; leaving GLSLC's compile information out of every game's keys would change every shader key"}),
     ('ue_texture_pool', '', {'what': "Unreal's texture streaming pool", 'now': 'game', 'goal': 'game', 'purpose': 'memory', 'why': "the game's own budget, raised to its Windows value"}),
+    ('ue_screen_percentage', '', {'what': "Unreal's screen percentages held", 'now': 'game', 'goal': 'game', 'purpose': 'rendering', 'why': "the game's own resolution, raised past the Switch 2's budget"}),
+    ('dlss_native', '', {'what': "DLSS's input at its output's size", 'now': 'game', 'goal': 'game', 'purpose': 'rendering', 'why': "the game's own resolution, raised past the Switch 2's budget"}),
     ('present_interval', '', {'what': 'one frame per display tick', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': 'right only for games whose logic does not count frames'}),
     ('fps_hold', '', {'what': 'no frame held past the cap', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': "the game's pacing"}),
     ('fps_target', '', {'what': 'frame rate target', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': 'a choice per game'}),

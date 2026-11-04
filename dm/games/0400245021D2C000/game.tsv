@@ -1,4 +1,4 @@
-# Yoshi and the Mysterious Book (Switch 2): the survey's profile (scripts/build_ipa_from_nsp.py, dm/games/profile_guess.py), unchanged by the bring-up (README.md)
+# Yoshi and the Mysterious Book (Switch 2): the survey's profile (scripts/build_ipa_from_nsp.py, dm/games/profile_guess.py), with the resolution of the bring-up (README.md)
 
 # ---- Identity ----
 title_id	0400245021D2C000
@@ -34,6 +34,11 @@ sys_resource	0x1400000
 # the decoded shader code archives: the engine's global shaders and the game's material shaders
 shader_groups	GlobalShaderCache=global .utoc#=game
 shader_note	Yoshi shaders
+
+# ---- Resolution ----
+# the game sets r.ScreenPercentage 50 and r.SecondaryScreenPercentage.GameViewport 80 and DLSS performance (768x432 for 1536x864 under 1920x1080): the Mac draws the scene at 1920x1080
+ue_screen_percentage	100
+dlss_native	on
 
 # ---- Address region check ----
 # the game calls nvnDeviceSetDepthMode with near = 0 in the check boot: the pipeline bases made before it runs are made for that mode

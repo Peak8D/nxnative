@@ -8,8 +8,9 @@ A Switch 2 game: v0 (base), SDK 20.5.15 built for the Switch 2 (`Ounce`), NVN2. 
 |---|---|---|
 | `mem_reserve 0x1028000000`, `mem_alias 0x1000000000`, `mem_stack 0x10000000`, `app_pool 0x240000000` | [`game.tsv`](game.tsv) | Unreal's `nninitStartup` reserves a 62 GB region and its allocator takes 37 GB of it: a 64 GB alias region; the Switch 2's 9 GB pool |
 | `depth_mode zero` | `game.tsv` | the game sets `nvnDeviceSetDepthMode` with near = 0 |
+| `ue_screen_percentage 100`, `dlss_native on` | `game.tsv` | the scene at the view's size: see [Resolution](#resolution) |
 
-The profile is the survey's (`scripts/build_ipa_from_nsp.py`, `dm/games/profile_guess.py`); the bring-up changed none of its values.
+The rest of the profile is the survey's (`scripts/build_ipa_from_nsp.py`, `dm/games/profile_guess.py`).
 
 ## Building
 
@@ -38,6 +39,10 @@ DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec GAME=0400245021D2C000 \
 ```
 
 Without `DOTNET_ROOT` every build fails: each key gets a `<key>.demand_failed` and the screen stays black. Delete those files after fixing the cause, or the host does not ask again. A scene's first visit builds a few hundred shaders (about a minute), so the first run through the opening is slow.
+
+## Resolution
+
+The game sets `r.ScreenPercentage` 50 and `r.SecondaryScreenPercentage.GameViewport` 80 at run time (its ini files say 100 for the second; dynamic resolution is off) and asks DLSS for its performance method: a 768x432 scene, made 1536x864 by DLSS and stretched to the 1920x1080 view. Its DLSS plugin asks for every method's optimal input at 1000x1000 and keeps the ratios. With `dlss_native` the host answers with the output's size, and `ue_screen_percentage` holds both percentages at 100: the scene is drawn at 1920x1080 and MetalFX's temporal scaler only anti-aliases. The GPU took about 8 ms a frame at 768x432 and takes about 19 ms at 1920x1080 on an M4 Pro (the first level).
 
 ## Rendering
 
