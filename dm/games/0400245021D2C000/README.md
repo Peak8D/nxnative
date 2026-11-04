@@ -8,9 +8,8 @@ A Switch 2 game: v0 (base), SDK 20.5.15 built for the Switch 2 (`Ounce`), NVN2. 
 |---|---|---|
 | `mem_reserve 0x1028000000`, `mem_alias 0x1000000000`, `mem_stack 0x10000000`, `app_pool 0x240000000` | [`game.tsv`](game.tsv) | Unreal's `nninitStartup` reserves a 62 GB region and its allocator takes 37 GB of it: a 64 GB alias region; the Switch 2's 9 GB pool |
 | `depth_mode zero` | `game.tsv` | the game sets `nvnDeviceSetDepthMode` with near = 0 |
-| `dlss_metalfx off` | `game.tsv` | DLSS drawn by the bilinear stand-in: see [Resolution](#resolution) |
 
-The rest of the profile is the survey's (`scripts/build_ipa_from_nsp.py`, `dm/games/profile_guess.py`).
+The rest of the profile is the survey's (`scripts/build_ipa_from_nsp.py`, `dm/games/profile_guess.py`). The resolution is the game's own: see [Resolution](#resolution).
 
 ## Building
 
@@ -42,10 +41,10 @@ Without `DOTNET_ROOT` every build fails: each key gets a `<key>.demand_failed` a
 
 ## Resolution
 
-The game sets `r.ScreenPercentage` 50 and `r.SecondaryScreenPercentage.GameViewport` 80 at run time (its ini files say 100 for the second; dynamic resolution is off) and asks DLSS for its performance method: a 768x432 scene, made 1536x864 by DLSS and stretched to the 1920x1080 view by the game. The profile keeps that and sets `dlss_metalfx off`: the DLSS step is the bilinear stand-in.
+The game sets `r.ScreenPercentage` 50 and `r.SecondaryScreenPercentage.GameViewport` 80 at run time (its ini files say 100 for the second; dynamic resolution is off) and asks DLSS for its performance method: a 768x432 scene, made 1536x864 by DLSS and stretched to the 1920x1080 view by the game. The profile keeps that, with MetalFX's temporal scaler for the DLSS step.
 
 Measured on an M4 Pro in the first level:
-- the game's resolution with MetalFX: about 8 ms of GPU time a frame;
+- the game's resolution with MetalFX: about 8 to 9 ms of GPU time a frame, 60 fps; with `dlss_metalfx off` about the same, but the scene shimmers: the game jitters it for DLSS's temporal resolve, which the bilinear stand-in does not do;
 - `ue_screen_percentage 100` with `dlss_native on` (the scene at 1920x1080, MetalFX at 1:1): about 18 ms, so frames missed 60 fps (`PPM_OutlineNew`, the ink outlines, alone took 4.7 ms; the attachments' loads and stores, about 1.35 GB a frame without the TBDR optimizations, which break this game's colours); with the stand-in instead of MetalFX about 16.5 ms, 58 to 60 fps;
 - `ue_screen_percentage 90 100` or `75 100`: the game's DLSS plugin turns itself off below 100 % (no network is made) and the game's own upscale costs more: 22 and 17 ms.
 

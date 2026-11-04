@@ -704,7 +704,6 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 
 | Key and value | Games | Binding | Why |
 |---|---|---|---|
-| `dlss_metalfx off` | [Yoshi](../../dm/games/0400245021D2C000/README.md) | `game`, at goal | MetalFX's temporal scaler costs GPU time the game's frame does not have |
 | `enc_thread on` | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | `game` → `host`, gap | what iOS does for every game: a default for every game after `regress.py check` on the games |
 | `game_env DOTNET_GCRegionRange=60000000` | [Absolum](../../dm/games/0100A83022A22000/README.md) | `game`, at goal | measured for the game's regions |
 | `net on` | [Star Fox](../../dm/games/0400E88025B1A000/README.md) | `game` → `host`, gap | libuv needs a loopback socket pair to start; the goal is loopback sockets offline for every game |
