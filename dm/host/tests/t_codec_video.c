@@ -19,10 +19,7 @@ void hle_signal_system_event(void *e) { g_ev[ev_slot(e)].set = 1; }
 void hle_clear_system_event(void *e) { g_ev[ev_slot(e)].set = 0; }
 static int ev_set(void *e) { return g_ev[ev_slot(e)].set; }
 static void destroy_ev(void *e) { g_ev[ev_slot(e)].bound = g_ev[ev_slot(e)].set = 0; }   // nn::os::DestroySystemEvent: closing the handle unbinds the event
-static bool trywait_ev(const void *e) { return g_ev[ev_slot((void *)e)].set; }   // nn::os::TryWaitSystemEvent
-void *guest_sym(const char *n) {
-    return !strcmp(n, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE") ? (void *)destroy_ev : !strcmp(n, "_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE") ? (void *)trywait_ev : NULL;
-}
+void *guest_sym(const char *n) { return !strcmp(n, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE") ? (void *)destroy_ev : NULL; }
 static vpx_image_t *black_i420(unsigned w, unsigned h) {
     vpx_image_t *c = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, w, h, 1); if (!c) return NULL;
     memset(c->planes[0], 16, (size_t)c->stride[0] * h);
@@ -78,6 +75,8 @@ int main(void) {
     assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 1000, false) && id == 1);
     assert(h_gs_trywait(&sync));
     assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) && w == 16 && h == 16 && cw == 16 && ch == 16 && ts == 1000 && !eos);
+    uint32_t cs = 7; w = h = 0;   // SDK 19's form: the same properties, and colour space 0
+    assert(!h_cv_vp9props19(&w, &h, &cw, &ch, &cs, &ts, &eos, dec, 0) && w == 16 && h == 16 && ts == 1000 && !eos && cs == 0);
     uint8_t nv12[16 * 16 * 3 / 2], rgba[16 * 16 * 4];
     assert(!h_cv_nv12(pool[0], 0, 0, 0, 16, 16, nv12, 16, 256, nv12 + 256, 16, 128));
     for (int i = 0; i < 256; i++) assert(abs(nv12[i] - 81) <= 3);
@@ -104,9 +103,8 @@ int main(void) {
     assert(!h_cv_vp9reg(dec, 2, pool[2], 0) && !h_cv_vp9acq(&idx, &sync, dec) && idx == 2);
     for (int i = 0; i < 2; i++) { h_cv_vp9rel(dec, (uint32_t)i, sync); assert(!h_cv_vp9acq(&idx, &sync, dec)); }   // the last two waiting pictures go out
     h_cv_vp9rel(dec, 2, sync); assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 2 && !h_gs_trywait(&sync));
-    assert(!h_spt_request(spt, &sync) && !ev_set(spt) && SPT(spt)->armed && !h_spt_trywait(spt));   // polled (TryWaitSyncPointEvent): not reached yet
+    assert(!h_spt_request(spt, &sync) && !ev_set(spt) && SPT(spt)->armed);
     assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 3000, false) && ev_set(spt) && !SPT(spt)->armed && h_gs_trywait(&sync));
-    assert(h_spt_trywait(spt));   // fired: its event stays signalled
 
     // End of stream with no data: the next released buffer carries it, with no picture
     assert(!h_cv_vp9submit(&id, dec, NULL, 0, 0, true) && d->eos_pending);
@@ -205,18 +203,23 @@ int main(void) {
         assert(nm[0] == 0 && nm[3] == 255 && nm[ns * 15 + 31 * 4 + 3] == 255);
         h_cv_poolfin(pt); assert(!dm_native_image(ha, &nm, &nz, &nw, &nh, &ns)); free(m);
     }
-    {   // SDK 19's forms (Mario Kart World): the ForCompat preference, Initialize with two sizes and no work buffer, and the output properties with the colour space; a
-        // buffer asked for before its picture is waited for briefly, then reported with the stream's size
-        _Alignas(16) static uint8_t d19[0x400], p19[0x40], m19[16 * 16 * 4]; uint32_t cs = 9;
-        cv_pref pc = h_cv_pref_compat(16, 16, 3, 0); assert(pc.w == 16 && pc.h == 16 && pc.fmt == 3 && pc.magic == CV_MAGIC);
-        assert(!h_cv_poolsize(&size, &align, &pc, 1) && !h_cv_pool(p19, m19, size, &pc, 1, 0));
-        assert(!h_cv_vp9init4(d19, 0x10000, 0x10000, 16, 16, 1, 1, 3) && cv_of(d19) && cv_of(d19)->codec == CV_VP9);
-        assert(!h_cv_vp9reg(d19, 0, p19, 0) && !h_cv_vp9acq(&idx, &sync, d19));
-        h_cv_vp9rel(d19, 0, sync); assert(!h_cv_vp9acq(&idx, &sync, d19) && !h_gs_trywait(&sync));
-        assert(!h_cv_vp9props2(&w, &h, &cw, &ch, &cs, &ts, &eos, d19, 0) && w == 16 && h == 16 && ts == 0 && !eos && cs == 0);
-        assert(!h_cv_vp9submit(&id, d19, vp9, sizeof vp9, 8000, false) && h_gs_trywait(&sync));
-        cs = 9; assert(!h_cv_vp9props2(&w, &h, &cw, &ch, &cs, &ts, &eos, d19, 0) && w == 16 && h == 16 && ts == 8000 && cs == 0);   // under 720 lines, no colour space stated: BT.601
-        assert(!h_cv_vp9fin(d19) && !cv_of(d19)); h_cv_poolfin(p19);
+    {   // SDK 19's Initialize by remote memory (two sizes before the picture size) and its preference: a VP9 decoder as the other forms make
+        _Alignas(16) static uint8_t d19[0x400];
+        cv_pref p19 = h_cv_pref19(0xffff0000u | 64, 32, 3, 1);   // the 16-bit sizes come unextended
+        assert(p19.w == 64 && p19.h == 32 && p19.fmt == 3 && p19.magic == CV_MAGIC);
+        assert(!h_cv_vp9rm19(d19, 0x10000, 0x200000, 0xabcd0000u | 16, 16, 1, 1, 3) && cv_of(d19) && cv_of(d19)->w == 16);
+        assert(!h_cv_vp9fin(d19));
+    }
+    {   // Blank native images (GameChat's camera pictures with no camera): zeroed storage with room for 16 bytes a pixel, apart from the decoder pools' handles, gone once freed
+        uint32_t a = dm_native_image_blank(384, 216), b = dm_native_image_blank(384, 216), nw, nh, ns; uint8_t *nm = NULL; uint64_t nz;
+        assert(a && b && a != b && a >> 31 && b >> 31);
+        assert(dm_native_image(a, &nm, &nz, &nw, &nh, &ns) && nw == 384 && nh == 216 && ns >= 384 * 16 && ns % 64 == 0 && nz >= (uint64_t)ns * 216);
+        for (uint64_t k = 0; k < nz; k++) assert(!nm[k]);
+        dm_native_image_blank_free(a); assert(!dm_native_image(a, &nm, &nz, &nw, &nh, &ns)); assert(dm_native_image(b, &nm, &nz, &nw, &nh, &ns));
+        dm_native_image_blank_free(b); dm_native_image_blank_free(b); dm_native_image_blank_free(0x100);   // twice, and a decoder pool's handle: nothing happens
+        uint32_t k[BLANK_MAX + 1]; for (int i = 0; i < BLANK_MAX; i++) assert((k[i] = dm_native_image_blank(32, 32)));
+        assert(!(k[BLANK_MAX] = dm_native_image_blank(32, 32)));   // full
+        for (int i = 0; i < BLANK_MAX; i++) dm_native_image_blank_free(k[i]);
     }
     printf("t_codec_video: all passed\n");
     return 0;

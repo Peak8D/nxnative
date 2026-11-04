@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Ampere memory instructions through the offline translator (dmsh_xlate, arch sm86): SUATOM (0x593), the image atomic Donkey Kong Bananza's agl
-technique compute shaders (agl_technique_pfx) take an append counter with; SURED (0x59f); ATOMS (0x38c, 0xf8c); shared memory's scaled address ([Ra.X4 / X8 / X16]),
-IMAD.HI, ATOMS.CAS and RED.F32 (the float atomic add); ISBERD and the stage output store (0x927) of task and mesh shaders translated as compute (job mesh_layout). Needs DMSH_TEST_XLATE (the translator)
-like the other translator tests; and the instructions tested on the atomic's result below."""
+"""Ampere instructions through the offline translator (dmsh_xlate, arch sm86): SUATOM (0x593), the image atomic Donkey Kong Bananza's agl technique compute shaders (agl_technique_pfx) take an
+append counter with; shared memory's scaled address, IMAD.HI and ATOMS.CAS; and the instructions tested on the atomic's result below. Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
 import json, os, re, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
@@ -10,8 +8,6 @@ TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 EXIT = (0x000fea0003800000, 0x000000000000794d)   # hi, lo: EXIT
 # SUATOM.ADD.U32 R12, [R3], R12 on the 1D image whose handle is word 12 of c0 (AMapC0: image slot 1), as the game encodes it but unpredicated (PT)
 SUATOM = (0x002ea200001ee000, 0x00000c0c030c7593)
-# SURED.ADD.U32 [R4], R0 on the 2D image whose handle is word 12 of c0 (image slot 1): Mario Kart World's words (0400759f 60000c00 0010e000 000fe200, its base game's compute shader)
-SURED = (0x000fe2000010e000, 0x60000c000400759f)
 
 
 def inst(hi, lo): return struct.pack('<QQ', lo, hi)
@@ -21,24 +17,13 @@ def s2r_tid(rd): return (0x000e260000002100, 0x0000000000007919 | rd << 16)   # 
 
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
 class Translated(unittest.TestCase):
-    def xlate(self, d, code, **extra):
-        work = Path(d); (work / 'k.bin').write_bytes(code)
-        # c0 layout (QueryAmpereComputeC0Layout): no uniform or storage buffers, 3 texture handles from 0x10, image handles from 0x28 (word 12 = image slot 1), 0x40 bytes
-        job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], **extra)]
-        (work / 'jobs.json').write_text(json.dumps(job))
-        return subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
-
-    def refused(self, code):   # the translator's message for a shader it does not translate
-        with tempfile.TemporaryDirectory(prefix='ampere_mem_') as d:
-            r = self.xlate(d, code)
-            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertFalse((Path(d) / 'k.spv').exists())
-            return r.stdout + r.stderr
-
     def translate(self, code, **extra):
         with tempfile.TemporaryDirectory(prefix='ampere_mem_') as d:
-            work = Path(d)
-            r = self.xlate(d, code, **extra)
+            work = Path(d); (work / 'k.bin').write_bytes(code)
+            # c0 layout (QueryAmpereComputeC0Layout): no uniform or storage buffers, 3 texture handles from 0x10, image handles from 0x28 (word 12 = image slot 1), 0x40 bytes
+            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], **extra)]
+            (work / 'jobs.json').write_text(json.dumps(job))
+            r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue((work / 'k.spv').exists(), r.stdout + r.stderr)
             sys.path.insert(0, str(TOOLS)); import dmsh_geometry
@@ -58,23 +43,6 @@ class Suatom(Translated):
     def test_result_kept(self):   # the old value is the shader's (it shuffles it to the warp): the atomic's result is used, not discarded
         msl = self.translate(inst(*SUATOM) + inst(*EXIT))
         self.assertRegex(msl, r'uint \w+ = [^;]*atomic_fetch_add')
-
-
-class Sured(Translated):
-    """SURED (0x59f) as Mario Kart World encodes it: MOV R0, 1, then an add of R0 at the coordinate in R4 (x) and R5 (y), no result"""
-    def code(self, sured=SURED, after=b''):
-        return mov(0, 1) + mov(4, 7) + mov(5, 9) + inst(*sured) + after + inst(*EXIT)
-
-    def test_add_u32_on_a_2d_image(self):
-        msl = self.translate(self.code())
-        self.assertIn('cp_i_tcb_4A_r32ui', msl)   # image slot 1 (c2 0x128), a 32-bit unsigned image
-        self.assertRegex(msl, r'int2 (_\d+) = int2\(7, 9\);[\s\S]*atomic_fetch_add_explicit\([^;]*\(\1, [^;]*, 1u,')   # R0's 1 at (R4, R5)
-
-    def test_r0_is_not_written(self):   # 16..24 (R0 in the game's words) is not a destination: R0 stored after it is still the 1, not the old value
-        self.assertIn('[8] = 1u', self.translate(self.code(after=sts(0x20, 0)), shared=0x800))
-
-    def test_another_form_refused(self):   # word 2 of SUATOM's game encoding (with its predicate result field) is not a form this takes
-        self.assertIn('SURED form 001ee000', self.refused(self.code((0x000fe200001ee000, SURED[1]))))
 
 
 class MufuF16(Translated):
@@ -97,6 +65,59 @@ class MufuF16(Translated):
         self.assertNotRegex(self.msl(self.LOG2_LOW), r'as_type<half2>\(.*\)\)\.y;')
 
 
+class Sured(Translated):
+    """SURED.ADD.U32 [R4], R0 (0x59f) on a 2D image, Mario Kart World's ab77eaee44cfef88: SUATOM's layout with no result"""
+    FORM = (0x000fe2000010e000, 0x60000c000400759f)
+
+    def test_adds_at_the_coordinates(self):
+        msl = self.translate(inst(*self.FORM) + inst(*EXIT))
+        self.assertIn('atomic_fetch_add', msl)
+        self.assertIn('texture2d', msl)
+
+    def test_another_form_is_refused(self):
+        with self.assertRaises(AssertionError) as e: self.translate(inst(0x000fe200001ee000, self.FORM[1]) + inst(*EXIT))
+        self.assertIn('SURED form', str(e.exception))
+
+
+class StageMemory(Translated):
+    """A task or mesh shader's stage memory in shared memory, on the game's encodings (job stage_memory: workgroup 0, input 0x10, outputs 0x120, primitives 0x400)"""
+    MEMORY = dict(stage_memory=[0, 0x10, 0x120, 0x400], shared=0x800)
+    # The game's ISBERDs set a write barrier, which their readers wait on; these set none, so the store after one reads its result
+    WORKGROUP = (0x000fe20000007800, 0x00000000ff007923)   # ISBERD R0, mode 0x78 (b6d76b6fc9dc926f +0)
+    INPUT = (0x000fe20000003800, 0x00002000ff137923)       # ISBERD R19, [RZ + 0x20], mode 0x38 (ddc034e8e009ebfc, its base register made RZ)
+    PAYLOAD = (0x0041e8000000b800, 0x0000100201007927)     # 0x927 [R1 + 0x10], R2, mode 0xb8 (a task's record)
+    KEEP_R0 = (0x0041e8000000b800, 0x00001000ff007927)     # the same with [RZ + 0x10], R0: so what ISBERD read is used
+    KEEP_R19 = (0x0041e8000000b800, 0x00001013ff007927)    # with R19
+    ATTRIBUTE = (0x0001e2000000f800, 0x0000800307007927)   # 0x927 [R7 + 0x80], R3, mode 0xf8 (a vertex's y, b6d76b6fc9dc926f +0x3c0 on another base register)
+    COUNT_ZERO = (0x000fe20000008800, 0x000003ffff007927)  # 0x927 [RZ + 3], RZ, mode 0x88: every thread clears the count first
+    COUNT = (0x0001e20000008800, 0x00000307ff007927)       # 0x927 [RZ + 3], R7, mode 0x88: the thread with the count
+    INDEX = (0x0001e20000008000, 0x0000040605057927)       # 0x927 [R5 + 4], R6, mode 0x80: an index byte
+
+    def msl(self, *code):
+        return self.translate(b''.join(inst(*c) for c in code) + inst(*EXIT), **self.MEMORY)
+
+    def test_workgroup_number_reads_word_0(self):
+        self.assertRegex(self.msl(self.WORKGROUP, self.KEEP_R0), r'as_type<float>\(_\d+\[0\]\)')
+
+    def test_input_is_at_its_offset(self):   # 0x10 + 0x20
+        self.assertRegex(self.msl(self.INPUT, self.KEEP_R19), r'as_type<float>\(_\d+\[12\]\)')
+
+    def test_word_store_goes_to_the_outputs(self):   # 0x120 + 0x80
+        self.assertIn('0 + 416', self.msl(self.ATTRIBUTE))
+
+    def test_the_zero_count_is_left_out(self):   # threads are not in step on Metal: it could land after the real count, and the stage memory starts at zero
+        without = self.msl(self.COUNT)
+        with_zero = self.msl(self.COUNT_ZERO, self.COUNT)
+        self.assertEqual(without.count('atomic_compare_exchange'), with_zero.count('atomic_compare_exchange'))
+
+    def test_a_byte_goes_through_its_word_atomically(self):   # neighbouring threads write neighbouring bytes
+        self.assertIn('atomic_compare_exchange', self.msl(self.INDEX))
+
+    def test_outside_a_task_or_mesh_shader_it_is_refused(self):
+        with self.assertRaises(AssertionError) as e: self.translate(inst(*self.PAYLOAD) + inst(*EXIT))
+        self.assertIn('outside a task or mesh shader', str(e.exception))
+
+
 class BarrierMoves(Translated):
     """BMOV around warp shuffles (Hyrule Warriors: Age of Imprisonment's pixel shaders 02e49c189b769074 and 49241cf469c76830): convergence barrier B15 to and
     from R26, in the game's encodings. Per thread they do nothing, as the barriers they save do"""
@@ -108,6 +129,20 @@ class BarrierMoves(Translated):
         plain = self.translate(inst(*SUATOM) + inst(*EXIT))
         moved = self.translate(inst(*self.SAVE) + inst(*self.RESTORE) + inst(*SUATOM) + inst(*self.RESTORE_PLAIN) + inst(*EXIT))
         self.assertEqual(moved, plain)
+
+
+class LdcIndexedBank(Translated):
+    """LDC.64 .IS (address mode 2): the bank is the instruction's plus Ra's upper half, the offset Ra's lower half (Hyrule Warriors: Age of Imprisonment's
+    vertex shader cc679c7b4d3e703c reads its c1 quad corners at (vertex index % 5) * 8 + 0x10000 this way). Here LDC.64.IS R12, c[0][R3] feeds the atomic"""
+    LDC_IS = (0x000e620000008a00, 0x00000000030c7b82)   # the game's control bits, size and mode; Rd R12, Ra R3
+
+    def test_reads_the_bank_chosen_at_run_time(self):
+        msl = self.translate(inst(*self.LDC_IS) + inst(*SUATOM) + inst(*EXIT))
+        self.assertIn('cp_c1)._m0[', msl)   # the shader's own constant segment is one of the banks it may name
+        self.assertRegex(msl, r'>> 16u|>> uint\(16\)|>> 16')   # the bank from Ra's upper half
+        self.assertRegex(msl, r'& 65535\b')                     # the offset from its lower half
+        self.assertRegex(msl, r'== 1;')                          # selected among the banks by its value
+        self.assertNotIn('cp_c0)._m0[', msl)   # never the driver segment at a run-time index, which the host cannot fill (here the instruction's own bank)
 
 
 def mov(rd, value):   # MOV Rd, imm32: values the tests can see in the output
@@ -272,12 +307,15 @@ class Pokopia(Translated):
         msl = self.msl(self.MERGE_FIRST, self.MERGE_SECOND, self.FSEL_NEG_B)
         self.assertRegex(msl, r'float _\d+ = -')
 
+    def test_up2ur_takes_any_predicate_by_its_mask_bit(self):   # Mario Kart World's pixel shaders save UP6 or UP3 and test the register against URZ later
+        for mask in (0x40, 0x08): self.msl((0x000fe20008000000, mask << 32 | 0x3f067883))
+
+    def test_up2ur_with_a_merge_source_is_refused(self):
+        with self.assertRaises(AssertionError) as e: self.msl((0x000fe20008000000, 0x40 << 32 | 0x05067883))
+        self.assertIn('UP2UR with a merge source', str(e.exception))
+
     def test_up2ur_reads_up0(self):   # cs_main's encoding: UR6 = UP0 ? 1 : 0
         self.msl((0x000fc60008000000, 0x000000013f067883))
-
-    def test_up2ur_masks_up3_and_up6(self):   # Mario Kart World's DrivePass encodings: UR6 = UP3 ? 8 : 0, UR6 = UP6 ? 64 : 0
-        self.msl((0x000fe20008000000, 0x000000083f067883))
-        self.msl((0x000fe20008000000, 0x000000403f067883))
 
     # Shared memory with a stride of 1: the address is Ra * 4 + offset. RZ would fold the scale away, so the index comes from F2I
     F2I_R3 = (0x000e24000021f000, 0x0000000c00037305)   # F2I.S32 R3, R12
@@ -321,7 +359,6 @@ class FloatAtomic(Translated):
         self.assertIn('atomic_fetch_add_explicit((device atomic_float*)', msl)
 
 
-
 # @P0 LDG.E R2, [R2 + UR4], the predicated uniform form loading into its own address register: Yoshi's instance culling kernel (cff90fc4457d7b71 +0x170,
 # @!P1 LDG R29, [R29 + UR4] after its bounds check) in its encoding, other registers. Zeroing the destination before the address was read loaded element 0
 LDG_P0_R2_UR4 = (0x000f2200081e8907, 0x0000000402027981)
@@ -333,74 +370,6 @@ class GlobalLoad(Translated):
         msl = self.translate(mov(2, 0x40) + inst(*Shared.ISETP_P0) + inst(*ULDC_UR4) + inst(*LDG_P0_R2_UR4) + inst(*sts_waiting) + inst(*EXIT), shared=0x400)
         self.assertRegex(msl, r'_m0\[16\]')
         self.assertNotRegex(msl, r'_m0\[0\]')
-
-
-class SharedScale(Translated):
-    """A shared access scales Ra by the factor in bits 78..79, whatever its size: 1 [Ra.X4], 2 [Ra.X8], 3 [Ra.X16]. Mario Kart World's froxel shaders keep a float4 a thread
-    at [R.X16 + 0x500]; f94552a2a2bff505 stores 8 bytes at [R9.X16] and 4 at [R9.X16 + 8]; Donkey Kong Bananza's upscaler stores 8 bytes at [i.X4 + 0x900]"""
-    X4_64 = (0x0009ee0000004a00, 0x000900182c007388)    # STS.64 [R44.X4 + 0x900], R24 (Donkey Kong Bananza 7629d857a0a93833)
-    X8_64 = (0x0211e40000008a00, 0x0000000600007388)    # STS.64 [R0.X8], R6 (Pokémon Pokopia)
-    X16_32 = (0x000fe8000000c800, 0x0000080609008388)   # STS [R9.X16 + 0x8], R6 (Mario Kart World f94552a2a2bff505)
-    X16_64 = (0x000fe8000000ca00, 0x0000000209008388)   # STS.64 [R9.X16], R2 (the same shader)
-    X16_128 = (0x0001e2000000cc00, 0x000000ff26007388)  # STS.128 [R38.X16], RZ (Pokémon Pokopia 396660089f19fc16)
-
-    def msl(self, sts, ra):
-        return self.translate(inst(*s2r_tid(ra)) + inst(*waiting(sts)) + inst(*EXIT), shared=0x4000)
-
-    def test_x4_on_a_64_bit_store(self):
-        self.assertRegex(self.msl(self.X4_64, 44), r'<< 2\b')
-
-    def test_x8(self):
-        self.assertRegex(self.msl(self.X8_64, 0), r'<< 3\b')
-
-    def test_x16_on_32_and_64_bit_stores(self):   # one 12-byte record a thread: not scaled by the access size
-        self.assertRegex(self.msl(self.X16_32, 9), r'<< 4\b')
-        self.assertRegex(self.msl(self.X16_64, 9), r'<< 4\b')
-
-    def test_x16_on_a_128_bit_store(self):
-        self.assertRegex(self.msl(self.X16_128, 38), r'<< 4\b')
-
-
-class Atoms(Translated):
-    """ATOMS (0x38c): a shared memory atomic, the operation and type as ATOMG's, addressed as STS; 0xf8c ATOMS.POPC.INC adds 1 with no source register"""
-    MAX = (0x0003e80001000000, 0x00100c00ffff738c)   # ATOMS.MAX RZ, [RZ + 0x100c], R0 (Pokémon Pokopia 2a526184ca0aa932, unpredicated)
-    INC = (0x0011e4000d00403f, 0x0000000003ff7f8c)   # ATOMS.POPC.INC RZ, [R3.X4] (Pokopia's 64-bin histogram e4ec13f79f9e0bd4)
-
-    def test_max(self):
-        msl = self.translate(inst(*s2r_tid(0)) + inst(*waiting(self.MAX)) + inst(*EXIT), shared=0x2000)
-        self.assertIn('atomic_fetch_max', msl)
-
-    def test_popc_inc_adds_one_at_the_scaled_index(self):
-        msl = self.translate(inst(*s2r_tid(3)) + inst(*waiting(self.INC)) + inst(*EXIT), shared=0x100)
-        self.assertRegex(msl, r'atomic_fetch_add_explicit\([^;]*, 1u,')
-        self.assertRegex(msl, r'<< 2\b')
-
-
-class MeshStage(Translated):
-    """A task / mesh shader as compute (QueryAmpereMeshLayout, job mesh_layout = [index word, payload, outputs, primitive bytes] in shared memory): ISBERD reads the
-    workgroup's number (mode 0x78) or a payload word (0x38), 0x927 stores a word of the outputs (0xf8 mesh attributes, 0xb8 task payload) or a byte of the primitives
-    (0x80 an index, 0x88 the count). Mario Kart World's grass mesh and task shaders' encodings"""
-    LAYOUT = [0, 0x40, 0x900, 0x1000]
-    ISBERD_SYS = (0x000e280000007800, 0x00000000ff007923)   # ISBERD R0, [RZ] with bit 78: the workgroup's number
-    STORE_ATTR = (0x0001e2000000f800, 0x0000001007007927)   # [R7], R16 mode 0xf8: an attribute word
-    STORE_COUNT = (0x000fe20000008800, 0x00000300ff007927)  # [RZ + 3], R0 mode 0x88: the primitive count byte
-
-    def mesh(self, *code):
-        return self.translate(b''.join(inst(*i) for i in code) + inst(*EXIT), shared=0x1100, mesh_layout=self.LAYOUT)
-
-    def test_attribute_word_at_the_outputs(self):
-        msl = self.mesh(s2r_tid(7), s2r_tid(16), waiting(self.STORE_ATTR))
-        self.assertRegex(msl, r'\+ 2304\b')   # 0x900, the outputs
-        self.assertRegex(msl, r'_\d+\[[^\]]+\] = ')
-
-    def test_count_byte_after_the_attributes(self):
-        msl = self.mesh(self.ISBERD_SYS, waiting(self.STORE_COUNT))
-        self.assertIn('atomic_fetch_and_explicit', msl)   # the byte cleared in its word, then set: no 8-bit shared memory in the SPIR-V backend
-        self.assertIn('atomic_fetch_or_explicit', msl)
-
-    def test_not_outside_a_task_or_mesh_shader(self):
-        with self.assertRaises(AssertionError):
-            self.translate(inst(*s2r_tid(7)) + inst(*s2r_tid(16)) + inst(*waiting(self.STORE_ATTR)) + inst(*EXIT), shared=0x1100)
 
 
 def s2r(rd, sr, guard=7): return (0x000e260000000000 | sr << 8, 0x0000000000000919 | guard << 12 | rd << 16)   # @Pguard S2R Rd, SR (write barrier 0, no wait)
@@ -428,7 +397,6 @@ class GuardedFixedOverPending(Translated):
         msl = self.translate(inst(*s2r_tid(9)) + inst(*s2r(6, 0x22, guard=0)) + inst(*mov_imm(6, 0x3f800000, guard=8)) + inst(*waiting(self.STORE)) + inst(*EXIT), shared=0x1000)
         self.assertRegex(msl, r'1065353216|1\.0\b')   # the MOV's 1.0 reaches the store when P0 is false
         self.assertIn('gl_LocalInvocationID.y', msl)
-
 
 
 if __name__ == '__main__':

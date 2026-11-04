@@ -57,6 +57,7 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
 }
 
 int main(void) {
+    setenv("DM_NVN_COUNT", "1", 1);   // the call-count checks below need the counting trampolines (off by default)
     // Engine-native limiters have no FPS state page. Their launcher cap must
     // still pace presents and select the display-link rate in display mode.
     { win_t w={.interval=1};nvn_present_config(60,1);dm_fps_state=NULL;
@@ -224,6 +225,9 @@ int main(void) {
     {
         NVNtextureBuilder tb; NVNtexture original = {0}, replacement = {0};
         P(nvnTextureBuilderSetDevice)(&tb, &dev); P(nvnTextureBuilderSetDefaults)(&tb);
+        NVNtextureSwizzle swz[4] = {0};
+        P(nvnTextureBuilderGetSwizzle)(&tb, &swz[0], &swz[1], &swz[2], &swz[3]);
+        EXPECT("TextureBuilderGetSwizzle default identity", 1, swz[0] == 2 && swz[1] == 3 && swz[2] == 4 && swz[3] == 5);
         P(nvnTextureBuilderSetSize2D)(&tb, 4, 4);
         P(nvnTextureBuilderSetFormat)(&tb, NVN_FORMAT_R8);
         P(nvnTextureBuilderSetStorage)(&tb, &pool, 0);
@@ -233,6 +237,8 @@ int main(void) {
         EXPECT("TextureCompare implicit/explicit identity", 1, P(nvnTextureCompare)(&original, &replacement));
         P(nvnTextureFinalize)(&replacement);
         P(nvnTextureBuilderSetSwizzle)(&tb, 1, 1, 1, 2);
+        P(nvnTextureBuilderGetSwizzle)(&tb, &swz[0], &swz[1], &swz[2], &swz[3]);
+        EXPECT("TextureBuilderGetSwizzle reads what was set", 1, swz[0] == 1 && swz[1] == 1 && swz[2] == 1 && swz[3] == 2);
         P(nvnTextureInitialize)(&replacement, &tb);
         EXPECT("TextureCompare A8 channel replacement", 0, P(nvnTextureCompare)(&original, &replacement));
         EXPECT("TextureCompare channel replacement symmetric", 0, P(nvnTextureCompare)(&replacement, &original));
@@ -938,23 +944,6 @@ int main(void) {
         EXPECT("1,048,576 R32 elements: 64 rows", 1, nvn_tbuf_rows(1048576, 4, 64, &w, &h, &row) && w == 16384 && h == 64 && row == 65536);
         EXPECT("no elements: no rows", 0, nvn_tbuf_rows(0, 4, 64, &w, &h, &row));
         EXPECT("several rows whose alignment would break the wrapped address: refused", 0, nvn_tbuf_rows(20000, 4, 3, &w, &h, &row));
-    }
-
-    // 10. NVN2 native images on a host-made handle (Mario Kart World's GameChat camera textures aborted the boot): a texture of the image's size and the builder's format on zeroed
-    //    host storage, and a handle neither the host nor a decoder pool made refused
-    {
-        native_builder_t nb; memset(&nb, 0, sizeof nb); h_ni_defaults(&nb); h_ni_device(&nb, &dev);
-        h_ni_handle(&nb, nvn_native_image_new(384, 216)); h_ni_format(&nb, NVN_FORMAT_RGBA8_SRGB);
-        native_image_t img; NVNtexture t;
-        EXPECT("native image: the host's handle initializes", 1, h_ni_init(&img, &nb));
-        EXPECT("texture from a native image succeeds", 1, h_ni_texture(&t, &img));
-        EXPECT("native image texture width", 384, P(nvnTextureGetWidth)(&t));
-        EXPECT("native image texture height", 216, P(nvnTextureGetHeight)(&t));
-        EXPECT("native image texture format", NVN_FORMAT_RGBA8_SRGB, P(nvnTextureGetFormat)(&t));
-        P(nvnTextureFinalize)(&t); h_ni_fini(&img); nvn_native_image_free(nb.handle);
-        h_ni_handle(&nb, 0x1234); h_ni_init(&img, &nb);
-        EXPECT("texture from a handle the host did not make fails", 0, h_ni_texture(&t, &img));
-        h_ni_fini(&img);
     }
 
     printf("== %d checks, %d failed ==\n", g_n, g_fail);

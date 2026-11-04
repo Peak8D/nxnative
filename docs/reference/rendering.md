@@ -30,7 +30,7 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 ### Texture swizzle through swizzled Metal views
 
 - **Symptom:** glyphs render as white boxes (the font atlas is `(1, 1, 1, R)`).
-- **Fix:** `TextureBuilderSetSwizzle` / `TextureViewSetSwizzle` are applied with Metal swizzled texture views (NVN and Metal channel enums have the same values). The swizzle names components of the NVN format, which the format's own mapping finds in Metal's (`nvn_fmt_to_mtl`: alpha 1 for RGBX-type formats; red and blue swapped for the RGB565 family, but only in linear and buffer textures, which read guest memory in place: every other host texture holds Metal's order, [RGB565-family textures in Metal's channel order](#rgb565-family-textures-in-metals-channel-order)).
+- **Fix:** `TextureBuilderSetSwizzle` / `TextureViewSetSwizzle` are applied with Metal swizzled texture views (NVN and Metal channel enums have the same values). The swizzle names components of the NVN format, which the format's own mapping finds in Metal's (`nvn_fmt_to_mtl`: alpha 1 for RGBX-type formats; red and blue swapped for the RGB565 family, all four reversed for RGBA4, but only in linear and buffer textures, which read guest memory in place: every other host texture holds Metal's order, [RGB565-family textures in Metal's channel order](#rgb565-family-textures-in-metals-channel-order)).
 - **Note:** Metal makes a swizzled view read-only (usage 0x1), so an image slot gets the same view without the mapping (`img_fit`), and the on-chip read merge leaves a swizzled sample alone.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (the font atlas); The Legend of Zelda: Echoes of Wisdom's hearts (GitHub PR #66, the RGB565 red / blue swap).
 
@@ -42,6 +42,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Note:** a view of one of these textures in another format of the same size (RG8, R16) now sees Metal's order where it saw the guest's in a packaged texture; no game is known to make one. A linear render target of these formats is drawn in Metal's order into guest memory; not seen.
 - **Check:** `t_view_swizzle` fills RGB565, RGB5A1, RGB5 and BGR565 textures from `CPU_UNCACHED` and `CPU_NO_ACCESS` pools through the real `tex_init_fill`, reads them on the GPU, draws into one texel and reads both again, and checks the guest storage is unchanged (379 checks). `t_readback` records the real commands for RGB565, RGB5A1 and RGB5: a buffer → texture copy sampled, copied back and read with `ReadTexels`; a Metal clear to red copied out and read; a packaged texture sampled, one with a texel cleared, one copied into from the cleared plain texture and read from its storage (78 checks, none failed). With the host before the fix, 18 of `t_readback`'s fail.
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#rendering) (GitHub issue #183, the Depths' cave walls: their initial-fill RGB565 / RGB5A1 textures), found and checked in the game by the issue's reporters (M1 with 1.2.1, M4 with 1.4.3); the copy paths found reviewing that fix, checked by the tests only.
+
+### RGBA4 textures in Metal's channel order
+
+- **Symptom:** outdoor battle ground and lower foliage are nearly black while the characters and the UI stay lit: a baked shadowmask takes the sunlight away. RGBA4 textures sample with their four channels reversed.
+- **Cause:** NVN's RGBA4 holds R, G, B, A from bit 0 up, Metal's `ABGR4Unorm` A, B, G, R; the host kept the guest's bits, so every channel read another's nibble. Super Mario RPG's shadowmask texels are mostly `0x0f00` (blue 1), sampled through a (B, G, R, A) mapping: red should read 1, and read 0, with green 1.
+- **Fix:** RGBA4 takes the [RGB565 family's](#rgb565-family-textures-in-metals-channel-order) conversion, all four nibbles reversed instead of red and blue (`rb_packed_shift` 4 in `rb_swap_rows` and `rb_swap.metal`), at the same crossings between guest memory and host textures (uploads are repacked on the CPU and leave the GPU deswizzle, as that family's do); linear and buffer textures, read in place, take `nvn_fmt_to_mtl`'s reversed mapping when sampled. That entry's note holds here too: a same-size view in another format (R16) sees Metal's order; no game is known to make one.
+- **Check:** `t_view_swizzle` samples the texels `0x8421` and `0x0f00` (every nibble different) uploaded and on a buffer, with and without the (B, G, R, A) mapping, cleared by Metal and filled from `CPU_UNCACHED` and `CPU_NO_ACCESS` pools; `t_readback` runs its RGB565-family copy, clear and `ReadTexels` cases for RGBA4. With the host before the fix, 40 of `t_view_swizzle`'s 554 checks and 6 of `t_readback`'s 154 cases fail.
+- **Found on:** [Super Mario RPG](../../dm/games/0100BC0018138000/README.md#found-on-this-game) (Mushroom Way's battles), checked in the game before and after.
 
 ### `nvnTextureCompare` compares the channel mapping
 
@@ -297,6 +305,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `DM_NVN_PASSDUMP` prints these views as `V <pass> c<i> view format …`; Mario uses only this one (1 of 80 passes in a course frame).
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
 
+### Textures of an sRGB / linear pair over the same storage
+
+- **Symptom:** a movie (or another picture the game converts each frame) does not show: the screen keeps the last 3D frame while the decoder delivers every picture. A pass dump shows a pass writing one serial and the composite sampling another serial of the same size, the two Metal formats `RGBA8Unorm` (70) and `RGBA8Unorm_sRGB` (71).
+- **Cause:** the game makes two NVN texture objects over the same pool and offset with the same description but for the format, `RGBA8` (0x25) and `RGBA8_SRGB` (0x38): it renders into the linear one and samples the sRGB one, which on NVN share their bytes. The storage-sharing table is keyed by pool, offset and the whole description ([Transient render targets shared by storage](#transient-render-targets-shared-by-storage)), so each got its own Metal texture and the sampled one never changed.
+- **Fix:** `tex_mtl_` (`nvn_mtl.m`): a texture that misses the table, but whose description differs from a shared texture's only by the other format of an sRGB / linear pair (`g_pfv_srgb`, the pairs Metal views without `PixelFormatView` usage), is a Metal view of that texture in its own format (2D and 2D array, single-sample). Other format changes keep their own texture. A usage upgrade (`tex_upgrade`) asked through the view upgrades its parent and makes the view again on it; a view whose parent left the sharing table (upgraded through its own serial, taken over, evicted) is dropped at its next lookup and made again on what holds the storage now (log line `stale sRGB / linear view dropped`).
+- **Check:** `make -C dm/gfx/tests GAME=<id> check_t_srgb_alias` (Metal validation): the sRGB texture is a view of the linear one, pixels written through the linear texture read back through the sRGB one, an `R32F` texture over the same storage keeps its own; after the linear texture is upgraded the view reads the upgraded storage, and an upgrade through the view upgrades the parent.
+- **Found on:** Mario Kart World (`0400C3F00006E000`; its profile is a separate pull request): the Grand Prix's cup opening movie (2560x1440: the YUV pass writes ser 31381 `RGBA8`, the composite samples ser 31382 `RGBA8_SRGB`, both at offset 0 of a 15 MB pool).
+
 ### Render-target use added on demand
 
 - **Symptom:** a clear of, or a format-converting copy into, a texture made without render-target use is declined.
@@ -422,6 +438,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** such clears are drawn as one triangle over the pass in the open render encoder (`clear_color_tri` / `clear_ds_tri` in `nvn_mtl.m`, adapted from MacNativeGames, MIT). The pipeline has the pass's formats, the clear's mask as the write mask of its slot and no writes to the other slots. Depth is `ALWAYS` (and written for a depth clear), stencil `REPLACE` through the clear's write mask, the scissor is clamped as for draws, and visibility counting is off for the triangle. The value comes from the frame arena through the triangle's own argument tables, and the draws' tables are put back after it. A clear outside a pass opens the pass as a draw would. Clears a load action can express keep it. Two cases are still cleared whole, logged once: a depth / stencil clear with a scissor outside a pass, and a partial stencil write mask.
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md): it issues the first whole-cleared case (a depth clear scissored to 8×8 of a 64×64 target), and so does Wonder ([Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md)). With `render_cond` ([Conditional rendering evaluated at replay](#conditional-rendering-evaluated-at-replay)) TOTK's scissored colour clears are all skipped; without it they are 50×50 tiles of a 500×400 target cleared to opaque black, about five a frame. [Metroid Dread](../../dm/games/010093801237C000/README.md) logged the red line once while loading on its smoke route.
 
+### A depth clear over the whole target with a partial stencil mask
+
+- **Symptom:** a pass loads a whole depth/stencil target every frame only to clear it: Donkey Kong Bananza clears a 2880x1620 Depth32F-S8 target with stencil mask `0x1`, before any pass is open, and loads 22.8 MB a frame for it.
+- **Cause:** any stencil mask other than 0 or 0xff takes `clear_ds_tri`, for depth too, and the triangle's pass loads both planes.
+- **Fix:** with no pass open and a depth clear that covers the whole target, the depth half is the next pass's load action (`OP_CLEAR_DS` in `nvn_mtl.m`), and only the stencil is drawn. A clear that is partial in either sense, or made with a pass open, keeps the triangle for both.
+- **Check:** `t_clear_ds`: the depth and stencil planes after a masked stencil clear with a full depth clear, outside and inside a pass.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) ([issue #1138](https://github.com/seedds/nxnative/issues/1138)): on an M2 MacBook Air the pass went from 346 to 284 µs of GPU time and its load from 22.8 MB to 4.6 MB a frame.
+
 ### Depth16 load-clears match fragment writes
 
 - **Symptom:** a tile grid in Ultrahand and Recall highlights; an `EQUAL` depth test rejects fragments writing the same depth as a cleared Depth16 target.
@@ -472,6 +496,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `fb_snap` in `nvn_mtl.m`, for every game: a new key takes an entry whose texture already has its format and size, preferring one no later draw can still reuse, then an entry no later draw can reuse, then the least recently used. An entry whose snapshot a draw may still reuse until the game's next barrier is taken last, so reuse is unchanged. The cache still holds at most eight textures.
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_feedback`: 30 snapshots of four sizes over six frames, each after a barrier, make four textures, and a live snapshot is not taken by another key while a stale entry is free (98 checks).
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#found-on-this-game). On the Mac (Apple M4 Pro, 2026-11-03, the regression route, frames 1,800-5,100) against `main` at `12915a31`: textures made 1,274-1,650 (4.4-6.0 GB) → 0-4 every 300 frames, residency commits 1,208-1,390 taking 150-212 ms → 31-65 taking 1.8-5.3 ms, the submit thread's kernel time 0.81-0.85 → 0.29 ms a frame (together with [the readback buffers](nvn-objects.md#readback-buffers-kept-for-reuse)); snapshots, reuses and tile reads a frame the same (13.0, 7.0, 22.0), 59.8 fps in both.
+
+### Bindless shaders taken as depth readers
+
+- **Symptom:** a scene with many bindless decals runs well below its target with the GPU busy, and a pass dump (`DM_NVN_PASSDUMP`) shows long runs of one-draw passes on the same targets, each loading and storing every attachment. Fire Emblem Fortune's Weave's battle maps: 31 consecutive one-draw passes on four 1024×576 targets a frame, 126.5 passes and about 1.4 GB of attachment loads and stores a frame.
+- **Cause:** `fb_prepare` marked the pass's depth attachment as read (`g_fb_dread`) for every fragment shader with handles in uniform buffers (`rf.bindless`), since which texture such a handle names is known only at replay. A later draw that writes depth then ended the pass ([the depth half of the snapshot rule](#same-pass-feedback-read-through-a-snapshot)). Fortune's Weave's decals are bindless and write depth, so each one ended the pass the one before it opened.
+- **Fix:** `fb_texu_reads` in `nvn_mtl.m`, for every game. A bindless fragment shader counts as a depth reader only when one of its TEXU handles, read from its uniform buffer as `encode_args` reads it for the draw, names a texture of the depth attachment's serial. Pool handles (`rf.pool`), dynamically indexed tables (`rf.dyn`) and a bindless shader with a TEXA binding still count as readers, as before. Like the colour rule, the test is by serial: a depth texture read through another NVN texture object over the same storage is not seen.
+- **Check:** `make -C dm/gfx/tests GAME=<id> run`. With `DM_AB=300 DM_NVN_FB_TEXU=ab` (an A/B switch used for the measurement, not part of the change) on the battle map, in-process over 16 phases: passes 126.5 → 93.5 a frame, attachment traffic 603 / 784 → 239 / 420 MB load / store, frame time p50 18.9 → 17.3 ms (MacBook Pro M1 Pro). Screenshots of the same frames with the rule off and on differ only where the fog and effects animate; the decals draw the same.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md#found-on-this-game).
 
 ### Mip-chain pass sampling the level it renders
 
@@ -558,6 +590,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** a draw pass on a target of 16 M pixels or more that loads what it keeps stops at the far corner of its scissor when that is at most half the target (`renderTargetWidth` / `renderTargetHeight`, `g_rp_aw` in `nvn_mtl.m`; `DM_NVN_RP_AREA=0` turns it off). Only the draw path opens such a pass. A draw whose scissor leaves the area ends it, and so does anything else that needs the pass (`rp_begin`).
 - **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md): each ink stamp's pass, scissored to 1952x2940 at (0, 3460), about 0.95 → 0.32 ms. Metal keeps what lies outside the area (a 6400x6400 target checked texel by texel on an M4 Pro, with API validation on).
 - **Note:** the same stamps sample the map they write, with a game barrier each, so each still takes a whole snapshot of it ([Same-pass feedback read through a snapshot](#same-pass-feedback-read-through-a-snapshot)), about 0.76 ms; a copy of the stamp's rectangle takes 0.09 ms, but nothing proves a stamp samples only inside it. **Open.**
+
+### Variable rate shading ignored
+
+- **Symptom:** `[RED] NVN unimplemented function called: nvnCommandBufferShadingRateImagePalette`, or `nvnCommandBufferBindShadingRateImage` or `nvnCommandBufferSetShadingRatePaletteMode`, every frame.
+- **Cause:** NVN2 lets a game shade tiles of a pass at a coarser rate. Metal's render passes have no per-tile rate: a rasterization rate map resamples the whole target instead, which is another thing.
+- **Fix:** `hle_nvn.c` accepts the three calls and records nothing. Shading every pixel is the most any rate asks for, so the picture is the same or sharper, and the only cost is GPU time where the game meant to save it. This drops a feature rather than emulating it, and the choice is a platform limit.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md), every frame; [Splatoon Raiders](../../dm/games/0400380020056000/README.md), the palette.
 
 ## Blend, depth and stencil
 
@@ -793,13 +832,6 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** recorded as `OP_DRAW_TEX` with the handle moved to the bound pools, as `bind_handles` does (`hle_nvn.c`), and replayed by `draw_tex` (`nvn_mtl.m`): its own render pass per bound colour target after the pass in progress, the pending clears landed first, with the scissor and channel mask; the replay's analyses (pass fusion, deferral, clear hoisting, the store lookahead) treat it as a texture copy. Region coordinates map to the targets' rows directly in either window origin, since the host keeps the Switch's memory layout. Blending is not applied (`[RED] DrawTexture with blending on`), and integer, depth and compressed targets are not drawn.
 - **Found on:** [Streets of Rage 4](../../dm/games/0100EC9010258000/README.md): its scene target gets the movie frame this way (the intro, the title's flames), from movie textures registered at IDs 256 and 257 of a second texture pool.
 
-### Variable rate shading ignored
-
-- **Symptom:** `[RED] NVN unimplemented function called: nvnCommandBufferShadingRateImagePalette` (and `BindShadingRateImage`, `SetShadingRatePaletteMode`), dozens a run.
-- **Cause:** NVN2's variable rate shading: a shading rate image and its palette lower the pixel shader's rate over parts of the target.
-- **Fix:** the three calls do nothing (`hle_nvn.c`): Metal keeps one pixel shader invocation a pixel, so the picture is the same or sharper, at the cost of the shading the game saved.
-- **Found on:** Mario Kart World (`0400C3F00006E000`, no profile yet), every frame; [Splatoon Raiders](../../dm/games/0400380020056000/README.md) calls the palette.
-
 ### Rasterizer discard preserves vertex storage writes
 
 - **Symptom:** the HUD and sky render but the battle's characters and terrain are absent; the replay logs `draw skipped: rasterizer discard` between model draws.
@@ -863,6 +895,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (FNA3D's NVN driver, `FNA3D_Driver_NVN.cpp`).
 
 ## Uniforms, copies and ordering
+
+### Bindless handles read from guest memory directly
+
+- **Symptom:** a `sample` of the submit thread shows `ubo_read` calling `-[MTLBuffer contents]` with `objc_retainAutorelease` at every handle read, and `objc_autoreleasePoolPop` at commit draining those buffers. Fire Emblem Fortune's Weave: about 4 % of the submit thread in the reads and as much again in the drain.
+- **Cause:** `contents` is an inner-pointer method, so under ARC each call retains and autoreleases the buffer; a bindless shader reads dozens of handles a draw. The argument writes in `encode_args_` asked the arena's buffer for its contents the same way.
+- **Fix:** `ubo_read` in `nvn_mtl.m`, for every game. A pool's buffer wraps guest memory without a copy at its own address (`mtl_pool_add` is the only place pools are made), so once `mtl_addr` finds the pool, the bytes are read at the guest address itself; `mtl_addr` still runs, so the pool check and its residency are unchanged. An arena keeps its buffer's `contents` (`NvArena.cpu`), and the argument, push-constant, driver-segment and border writes go through it. If pools ever stop being no-copy wrappers, this read would need the buffer again.
+- **Check:** `make -C dm/gfx/tests GAME=<id> run`. Fortune's Weave's battle map (MacBook Pro M1 Pro): submit 42.8k → 39.2k instructions per draw.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md).
 
 ### Depth plane copies between depth formats
 
@@ -1211,6 +1251,13 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - **Fix:** `profile_guess.py` `shader_sources` now reads the imports of the loose NROs in the RomFS (`romfs_nro_imports`): when one imports `nvnBootstrapLoader`, the game is an NVN game whatever `main` imports. Digimon keeps the GL rule: it has no NRO. The survey, which has only a RomFS manifest, called Portal 2 an OpenGL game and left GLSLC out of its modules until `nx_extract --manifest` also wrote the RomFS's NROs (`romfs_nro/`, 60 MB for Portal 2's 21) for it to read the same way.
 - **Found on:** [Portal](../../dm/games/01007BB017812000/README.md); [Portal 2](../../dm/games/0100ABD01785C000/README.md) (the survey).
 
+### NVN and its own GLSLC under a main that also links EGL
+
+- **Symptom:** the NSP script took the game for an OpenGL one (`main imports EGL and names glShaderSource`) and translated 2 GL shaders; the game boots with sound and answers input, but the window stays black, and the log has `[nvn-mtl] [RED] shader … is not in the shader map` for every shader it makes, with no EGL call at all.
+- **Cause:** the engine links both paths. `main` imports 14 EGL functions and names `glShaderSource`, but also imports `nvnBootstrapLoader` and 8 GLSLC functions (`glslcCompile` among them, defined in `subsdk2`), holds 4 GLSL sources, and keeps the rest in its RomFS `.shader` files (RIFF `SHDR`, a `gl43` chunk with `#version 450` GLSL). On the Mac it draws with NVN and compiles every shader at run time with GLSLC; taken for OpenGL, it got no GLSLC capture.
+- **Fix:** `profile_guess.py` `shader_sources`: a `main` that imports `nvnBootstrapLoader` and `glslcCompile`, holds GLSL sources, and loads a module that defines `glslcCompile` is an NVN game whatever else it links, and gets the GLSLC capture as Three Houses does. Digimon keeps the GL rule (no GLSLC compile of its own); of 16 games extracted here (Super Mario Odyssey, Super Smash Bros. Ultimate, Metroid Dread, Hollow Knight: Silksong, Cuphead, DRAGON BALL FighterZ and others), only Rayman's decision changes. `test_nro_graphics.py` has both cases.
+- **Found on:** Rayman 30th Anniversary Edition (`01007C6025688000`, 1.0.0, SDK 20.5.15, Digital Eclipse): the capture gets 21 shaders in 30 s, the split makes 42, and it plays with picture and sound at 60 fps.
+
 ### Which GL functions a game calls
 
 - **Symptom:** a jump to address 0 right after `glGetFloatv(0xb12)` (`lr=main+0x2d58c4`).
@@ -1298,3 +1345,11 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - **Fix:** `dm/ios/Sources/DmLayout.h` computes the picture and controls rectangles from the view's bounds, its safe area and UIKit's division region (`UIHingeInteraction`, iOS 27.1); front_ios.m lays the views out from them and DmGamepad.m its controls. Landscape keeps the overlay unless the hinge is half open over a horizontal division; portrait puts a fitted 16:9 picture above the controls, at the division or the midpoint. On a Duo in portrait only the top safe-area inset applies. Game touches map through the picture rectangle (with [Fill](../settings.md#picture), larger than the view), and a layout change releases held inputs. The phone's orientation list stays landscape (the Duo's inner display follows its bounds), the iPad's has all four and no `UIRequiresFullScreen`. While a TV shows the picture the phone is all controls (`dm_layout_pad_only`). The drawable's scale is set in one place, `DmGameView layoutSubviews`: the screen's pixels, at most `maxPixelWidth` across, which the TV sets to 1920, so a later layout pass cannot undo the TV's 1080p cap.
 - **Check:** the [Duo harness](../../dm/ios/tests/duo/README.md) tests layout, hit targets, touches, the in-game menu's live settings and the drawable cap in the Simulator with synthetic host state. A physical Duo was tested by the PR #683 author on their fork; full-game tests on a physical iPad and a Duo with this repository's build are open.
 - **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md).
+
+### The picture laid out in the shape the game presents
+
+- **Symptom:** with *Picture shape* at 1.43:1 (`DM_SCREEN_ASPECT`) the game renders 1920x1344, but on an iPhone Duo in Fit (the default) the picture comes out smaller than the 16:9 one, with black bars on all four sides; it fills the screen only in Fill. On the Mac a click lands off the point under the pointer (it was mapped on a 16:9 rectangle of the window).
+- **Cause:** the front ends assumed a 16:9 picture. iOS sized the game's view to the largest 16:9 rectangle (`DmLayout.h` `dm_aspect_fit`, `dm_aspect_fill`) and the present then fitted the 1.43:1 frame inside that 16:9 drawable (`present_viewport`), so the picture was fitted twice; the Mac's mouse-to-touch mapping (`front_mac.m`) used the same 16:9 rectangle.
+- **Fix:** the present reports the shape of the frame it draws, the valid rectangle of the presented texture, whenever its width / height changes (`nvn_mtl.m` `present_now` → `front.h` `front_picture_shape`; every graphics API presents there). The iOS front end lays the game's view out in that shape (`DmLayout.h` takes it as a parameter: the overlay, the split, Fill and the TV alike), so a 1.43:1 picture fills a 1.43:1 screen in Fit and touches are normalized on the picture as drawn; the Mac maps the mouse on the picture's own rectangle. A 16:9 game reports 16:9 and keeps its layout, and a size change of the same shape (1280x720 handheld, 1920x1080 docked) is not reported.
+- **Check:** the [Duo harness](../../dm/ios/tests/duo/README.md) tests the taller picture in Fit, in Fill and on a wider screen, and the production root view following a reported shape and returning to 16:9. Not yet run on a device.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md#screen-shape-dm_screen_aspect-current) and [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md#screen-shape-dm_screen_aspect-current) with `DM_SCREEN_ASPECT=1.43`.

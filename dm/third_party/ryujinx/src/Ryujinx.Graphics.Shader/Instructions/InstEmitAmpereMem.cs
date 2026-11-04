@@ -29,13 +29,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
-            x(0x38c, InstName.Atoms, AAtoms, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
             x(0x987, InstName.Stl, AStLocalShared, N, writesRd: false);
             x(0x388, InstName.Sts, AStLocalShared, N, writesRd: false);
             x(0x988, InstName.Sts, AStLocalShared, N, writesRd: false);
+            x(0x38c, InstName.Atoms, AAtoms, N);
             x(0x38d, InstName.Atoms, AAtomsCas, N);
             x(0x992, InstName.Membar, AMembar, N, writesRd: false);
             x(0x9ab, InstName.Membar, AErrbar, N, writesRd: false);
@@ -125,28 +125,26 @@ namespace Ryujinx.Graphics.Shader.Instructions
         public static void AIsberd(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
-            int[] mesh = context.TranslatorContext.GpuAccessor.QueryAmpereMeshLayout();
 
-            if (mesh != null)
+            int[] stage = context.TranslatorContext.GpuAccessor.QueryAmpereStageMemory();
+
+            if (stage != null)
             {
-                // A task / mesh shader translated as compute (QueryAmpereMeshLayout): ISBERD reads its stage input, the workgroup's index with bit 78 (mode 0x78; the
-                // task shader's draw-wide task number, the mesh shader's number among its task's launches) and otherwise a word of the payload its task wrote
-                // (mode 0x38, [Ra + offset]). Mario Kart World's grass: the mesh shader reads its blade record at [index * 0x28 + 0x10..0x34]
-                Operand addr = x.Bit(78) ? Const(mesh[0]) : context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const(mesh[1] + (int)x.SignedField(40, 64)));
+                // A task or mesh shader's stage input (QueryAmpereStageMemory). Mode 0x78: its workgroup's number; 0x38: a word of the payload its task wrote, [Ra + offset];
+                // 0x34: a 16-bit entry of it (Fast Fusion's ship and collectible mesh shaders read a halfword array at [index * 2 + 0x18] that their task shaders write
+                // with stage output mode 0xb4), zero-extended
+                int mode = x.Bits(72, 80);
 
-                if (!x.Bit(78) && x.Bits(72, 80) == 0x34)
+                if (mode != 0x78 && mode != 0x38 && mode != 0x34)
                 {
-                    // Mode 0x34: a 16-bit payload entry (Fast Fusion's ship and collectible mesh shaders read a halfword array at [index * 2 + 0x18] that their task
-                    // shaders write with stage output mode 0xb4): its word, shifted down by the half, zero-extended
-                    EmitLoad(context, StorageKind.SharedMemory, LsSize2.B32, context.BitwiseAnd(addr, Const(~3)), x.Rd, 0);
+                    throw AFail(context, $"ISBERD mode {mode:x2} in a task or mesh shader");
+                }
 
-                    if (x.Rd < RegisterConsts.RegisterZeroIndex)
-                    {
-                        Operand rd = Register(x.Rd, RegisterType.Gpr);
-                        Operand half = context.ShiftLeft(context.BitwiseAnd(addr, Const(2)), Const(3));
-                        context.Copy(rd, context.BitwiseAnd(context.ShiftRightU32(rd, half), Const(0xffff)));
-                    }
+                Operand addr = mode == 0x78 ? Const(stage[0]) : context.IAdd(AGpr(x.Ra), Const(stage[1] + (int)x.SignedField(40, 64)));
 
+                if (mode == 0x34)
+                {
+                    EmitLoad(context, StorageKind.SharedMemory, LsSize2.U16, addr, x.Rd, 0);
                     return;
                 }
 
@@ -160,40 +158,31 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
         }
 
-        // The stage output store of task and mesh shaders (0x927) [Ra + offset], Rb: in shared memory where the build reads it back into the Metal object / mesh
-        // outputs (QueryAmpereMeshLayout). Mode 72..79: 0xb8 a task payload word, 0xf8 a mesh attribute word (vertex attributes component by component, 0x80 bytes
-        // a component for 32 vertices, then the primitive attributes), 0x80 a byte of the primitive indices, 0x88 the primitive count byte (at 3, the indices from 4)
+        // Task and mesh shaders' stage output (0x927), [Ra + offset], Rb, mode 72..79: 0xb8 a word of the task's payload; 0xf8 a word of a mesh shader's attributes (each component
+        // 0x80 bytes for 32 vertices or primitives); 0x88 the primitive count byte, 0x80 a primitive index byte. Bytes go through the shared memory's byte store, a compare-and-swap
+        // on the word (SharedStoreSmallIntCas), since neighbouring threads write neighbouring bytes. A mesh workgroup of 32 threads is one warp on the console, all at the same
+        // instruction, so the zero count each thread writes first (Mario Kart World: at its start) cannot pass the count one thread writes later; Metal's threads run in no such step,
+        // and the stage memory starts at zero (dmsh_meshstage.py), so that store is left out
         public static void AStageOut(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
-            int[] mesh = context.TranslatorContext.GpuAccessor.QueryAmpereMeshLayout();
+            int[] stage = context.TranslatorContext.GpuAccessor.QueryAmpereStageMemory();
             int mode = x.Bits(72, 80);
 
-            if (mesh == null || (mode != 0xb8 && mode != 0xf8 && mode != 0xb4 && mode != 0x80 && mode != 0x88))
+            if (stage == null || (mode != 0xb8 && mode != 0xf8 && mode != 0xb4 && mode != 0x88 && mode != 0x80))
             {
                 throw AFail(context, $"stage output store mode {mode:x2} outside a task or mesh shader");
             }
 
-            bool word = mode == 0xb8 || mode == 0xf8, half = mode == 0xb4;
-            Operand addr = context.IAdd(x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr), Const((word || half ? mesh[2] : mesh[3]) + (int)x.SignedField(40, 64)));
-
-            if (word)
+            if (mode == 0x88 && x.Rb == RegisterConsts.RegisterZeroIndex)
             {
-                EmitStore(context, StorageKind.SharedMemory, LsSize2.B32, addr, x.Rb, 0);
                 return;
             }
 
-            // Mode 0xb4: a 16-bit task payload entry (Fast Fusion: [index * 2 + 0x18], read back by ISBERD mode 0x34), into its word as a byte is below
-            int fill = half ? 0xffff : 0xff;
-
-            // A byte: the SPIR-V backend has no 8-bit shared memory, and neighbouring threads write neighbouring bytes of a word, so it goes into its word with
-            // two atomics (clear the byte, then set it)
-            Operand id = Const(context.ResourceManager.SharedMemoryId);
-            Operand wordIndex = context.ShiftRightU32(addr, Const(2));
-            Operand shift = context.ShiftLeft(context.BitwiseAnd(addr, Const(half ? 2 : 3)), Const(3));
-            Operand value = context.ShiftLeft(context.BitwiseAnd(x.Rb == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr), Const(fill)), shift);
-            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.And, AtomSize.U32, id, wordIndex, context.BitwiseNot(context.ShiftLeft(Const(fill), shift)));
-            EmitAtomicOp(context, StorageKind.SharedMemory, AtomOp.Or, AtomSize.U32, id, wordIndex, value);
+            // 0xb4: a 16-bit entry of the task's payload (Fast Fusion: [index * 2 + 0x18], read back by ISBERD mode 0x34), a halfword store as the bytes' are
+            bool word = mode == 0xb8 || mode == 0xf8, half = mode == 0xb4;
+            Operand addr = context.IAdd(AGpr(x.Ra), Const((word || half ? stage[2] : stage[3]) + (int)x.SignedField(40, 64)));
+            EmitStore(context, StorageKind.SharedMemory, word ? LsSize2.B32 : half ? LsSize2.U16 : LsSize2.U8, addr, x.Rb, 0);
         }
 
         public static void ALepc(EmitterContext context)
@@ -508,22 +497,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
         }
 
-        // SUATOM Rd, [Ra], Rb (0x593): an atomic on an image through a handle, laid out as SUST's (handle 40..59, dimension 61..64) and as ATOMG's (operation
-        // 87..91, size 73..76, Pu 81..83). Donkey Kong Bananza's append compute shaders take a counter with it (SUATOM.ADD.U32 on a 1D image, the old value
-        // shuffled to the warp) before their SUST. A handle in another bank goes through with it, as SULD's and SUST's (Yoshi's compute shaders: c[3]); a predicate result is refused.
-        public static void ASuatom(EmitterContext context)
-        {
-            AmpereOp x = new(context.CurrOp);
-            (int handle, int cbufSlot) = ATexHandle(context, x);
-
-            if (x.Bits(81, 84) != 7)
-            {
-                throw AFail(context, "SUATOM with a predicate result");
-            }
-
-            EmitSuatom(context, (SuDim)x.Bits(61, 64), 0, (SuatomOp)x.Bits(87, 91), (SuatomSize)x.Bits(73, 76), handle, x.Ra, x.Rb, 0, x.Rd, false, isBindless: false, compareAndSwap: false, cbufSlot: cbufSlot);
-        }
-
         // SURED [Ra], Rb (0x59f): an image reduction through a handle, SUATOM's layout without a result (handle 40..59, dimension 61..64, coordinates from Ra,
         // the value in Rb; 16..24 is not a destination). No encoder documents it: the fields are Eglantine's lowering of the same instruction to Maxwell
         // SURED.ADD.U32 (lower_to_maxwell.h, commit 11a110898f). Only that form is taken: word 2 0x0010e000 is SUATOM's word 2 in Donkey Kong Bananza's
@@ -555,6 +528,22 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             EmitSured(context, (SuDim)x.Bits(61, 64), 0, op, SuatomSize.U32, handle, x.Ra, x.Rb, 0, false, isBindless: false, cbufSlot: cbufSlot);
+        }
+
+        // SUATOM Rd, [Ra], Rb (0x593): an atomic on an image through a handle, laid out as SUST's (handle 40..59, dimension 61..64) and as ATOMG's (operation
+        // 87..91, size 73..76, Pu 81..83). Donkey Kong Bananza's append compute shaders take a counter with it (SUATOM.ADD.U32 on a 1D image, the old value
+        // shuffled to the warp) before their SUST. A handle in another bank goes through with it, as SULD's and SUST's (Yoshi's compute shaders: c[3]); a predicate result is refused.
+        public static void ASuatom(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            (int handle, int cbufSlot) = ATexHandle(context, x);
+
+            if (x.Bits(81, 84) != 7)
+            {
+                throw AFail(context, "SUATOM with a predicate result");
+            }
+
+            EmitSuatom(context, (SuDim)x.Bits(61, 64), 0, (SuatomOp)x.Bits(87, 91), (SuatomSize)x.Bits(73, 76), handle, x.Ra, x.Rb, 0, x.Rd, false, isBindless: false, compareAndSwap: false, cbufSlot: cbufSlot);
         }
 
         // BAR.SYNC: the workgroup barrier

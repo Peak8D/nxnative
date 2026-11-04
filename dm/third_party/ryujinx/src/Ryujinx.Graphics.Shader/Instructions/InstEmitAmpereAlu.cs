@@ -86,7 +86,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x804, InstName.R2p, AR2p, N, writesRd: false);
             x(0x204, InstName.R2p, AR2p, N, writesRd: false);
             x(0x803, InstName.P2r, AP2r, N);
-            x(0x883, InstName.P2r, AUp2ur, N, uniform: true);
             x(0x203, InstName.P2r, AP2r, N);
             x(0x81c, InstName.Psetp, APlop3, N, writesRd: false);
             x(0x89c, InstName.Psetp, APlop3, N, uniform: true, writesRd: false);
@@ -516,7 +515,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
             ASet(context, x, context.PackHalf2x16(context.FPSaturate(lo, sat), context.FPSaturate(hi, sat)));
         }
 
-
         public static void AHadd2(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
@@ -638,37 +636,19 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (x.Bit(91) || mode == 1)
             {
-                throw AFail(context, "LDC with a bindless bank or an address mode");
+                throw AFail(context, "LDC with a bindless bank or the .IL address mode");
             }
 
-            // Modes 2 and 3 (.IS / .ISL, segmented): the bank is the instruction's plus Ra's high half, the offset Ra's low half, as Maxwell's LDC.IS (InstEmitMemory.cs Ldc).
-            // Fast Fusion's radeonrays/restructure_bvh reads c[R12.hi][R12.lo] that way
-            if (mode >= 2)
+            if (mode != 0)
             {
-                Operand ra = x.Ra == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Ra, RegisterType.Gpr);
-                Operand slot = context.IAdd(Const(x.Bits(54, 59)), context.BitfieldExtractU32(ra, Const(16), Const(16)));
-                Operand addr = context.IAdd(context.BitwiseAnd(ra, Const(0xffff)), Const((int)x.SignedField(38, 54)));
-                int size = x.Bits(73, 76);
+                // .IS / .ISL, as Maxwell's (InstEmitMemory.Ldc): the bank is the instruction's plus Ra's upper half, the offset Ra's lower half plus the instruction's.
+                // Hyrule Warriors: Age of Imprisonment's vertex shader cc679c7b4d3e703c reads c[1][(vertex index % 5) * stride] this way, and its pixel shader
+                // 059a0a910ff87a26 c[1][0x60 + R12 * scale]: the compiler adds 0x10000 to the offset. The bank is chosen at run time among the banks the shader
+                // can reach (ARuntimeBanks); a run-time bank 0 in a compute shader is not remapped (AMapC0).
+                Operand ra = Register(x.Ra, RegisterType.Gpr);
+                Operand slot = context.IAdd(Const(x.Bits(54, 59)), context.ShiftRightU32(ra, Const(16)));
 
-                if (size > 5)
-                {
-                    throw AFail(context, $"constant load size {size}");
-                }
-
-                Operand wordOffset = context.ShiftRightU32(addr, Const(2));
-
-                for (int k = 0; k < (size == 5 ? 2 : 1) && x.Rd + k < RegisterConsts.RegisterZeroIndex; k++)
-                {
-                    Operand value = EmitLoadConstant(context, slot, context.IAdd(wordOffset, Const(k)));
-
-                    if (size < 4)
-                    {
-                        value = ExtractSmallInt(context, (LsSize)size, GetBitOffset(context, addr), value);
-                    }
-
-                    context.Copy(Register(x.Rd + k, RegisterType.Gpr), value);
-                }
-
+                ALoadConstant(context, x, slot, context.BitwiseAnd(ra, Const(0xffff)), (int)x.SignedField(38, 54), uniform: false, ARuntimeBanks(context, x.Bits(54, 59)));
                 return;
             }
 
@@ -685,6 +665,39 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
         private static void ALoadConstant(EmitterContext context, AmpereOp x, int bank, Operand index, int offset, bool uniform)
         {
+            ALoadConstant(context, x, Const(bank), index, offset, uniform, null);
+        }
+
+        // The banks a run-time bank of LDC .IS can be: the shader's own constant segment (c1, which every shader has), the instruction's bank and every bank the
+        // shader's other constant reads name. A bank outside them reads 0, as in Ryujinx's Maxwell path for an unbound one. c0 is left out: the host fills the
+        // driver segment only at offsets known when the shader is built, and a shader indexing it at run time is not loaded (dmsh_build.py unfillable), which
+        // took pixel shader 059a0a910ff87a26 (it reads c0 elsewhere) out with its indexed c1 read
+        private static uint ARuntimeBanks(EmitterContext context, int bank)
+        {
+            uint banks = 1u << 1 | 1u << bank;
+
+            foreach (DecodedFunction function in context.Program)
+            {
+                foreach (Block block in function.Blocks)
+                {
+                    foreach (InstOp op in block.OpCodes)
+                    {
+                        AmpereOp y = new(op);
+
+                        if (AmpereTable.ReadsConstantBank(y) && !y.Bit(91))
+                        {
+                            banks |= 1u << AMapC0(context, y.Bits(54, 59), (int)y.SignedField(38, 54)).Bank;
+                        }
+                    }
+                }
+            }
+
+            return banks & ~1u;
+        }
+
+        // slot: a constant bank, or one chosen at run time among banks (EmitLoadConstant)
+        private static void ALoadConstant(EmitterContext context, AmpereOp x, Operand slot, Operand index, int offset, bool uniform, uint? banks)
+        {
             int size = x.Bits(73, 76);
 
             if (size > 5)
@@ -699,7 +712,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             for (int k = 0; k < (size == 5 ? 2 : 1) && rd + k < zero; k++)
             {
-                Operand value = EmitLoadConstant(context, Const(bank), context.IAdd(wordOffset, Const(k)));
+                Operand value = EmitLoadConstant(context, slot, context.IAdd(wordOffset, Const(k)), banks);
 
                 if (size < 4)
                 {
@@ -1357,23 +1370,22 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitP2r(context, Register(x.Ra, RegisterType.Gpr), Register(x.Rd, RegisterType.Gpr), mask, (ByteSel)x.Bits(76, 78), false);
         }
 
-        // UP2UR URd, URZ, mask (32..64): bit k of URd is UPk where mask bit k is set, the other bits zero. Pokemon Pokopia's two compute shaders encode mask 1, Mario Kart World's
-        // DrivePass shaders also 0x08 and 0x40. A merge source in place of URZ (P2R's form) is not seen here
+        // UP2UR URd, URZ, mask: bit k of URd is the uniform predicate UPk where bit k of the mask is set, as P2R does for the general predicates (7 is the always-true UPT).
+        // Pokemon Pokopia's compute shaders use mask 1. Mario Kart World's pixel shaders save one predicate with mask 8 or 0x40 and test the register against URZ later
         public static void AUp2ur(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
-            uint mask = x.Imm32;
 
-            if (x.Bits(24, 30) != RegisterConsts.UniformZeroIndex || mask == 0 || mask > 0x7f)
+            if (x.Bits(24, 30) != RegisterConsts.UniformZeroIndex || (x.Imm32 & ~0xffu) != 0)
             {
-                throw AFail(context, "UP2UR with a merge source or a mask past UP6");
+                throw AFail(context, "UP2UR with a merge source or a mask past the predicates");
             }
 
             Operand res = Const(0);
 
-            for (int k = 0; k < 7; k++)
+            for (int k = 0; k < 8; k++)
             {
-                if ((mask & (1u << k)) != 0)
+                if ((x.Imm32 >> k & 1) != 0)
                 {
                     res = context.BitwiseOr(res, context.ConditionalSelect(APredReg(k, uniform: true), Const(1 << k), Const(0)));
                 }

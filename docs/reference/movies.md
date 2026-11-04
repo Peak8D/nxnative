@@ -10,6 +10,13 @@ The SDK's movie library (`movie::Decoder`, `movie::Extractor`), which the host t
 - **Cause:** the SDK movie library's hardware decoder opens nvdrv directly.
 - **Fix:** the host takes over `movie::Decoder` (`hle_movie.c`, [`movie::Decoder` taken over as a MediaCodec-style protocol](#moviedecoder-taken-over-as-a-mediacodec-style-protocol)); nvdrv opens fail (`hle_nvdrv.c`).
 
+### SDK 1 movie buffer getters
+
+- **Symptom:** constructing a movie decoder aborts with `FATAL movie: missing SDK symbol _ZNK5movie6Buffer4DataEv`.
+- **Cause:** SDK 1.3.1 exports `movie::Buffer::Data()`, `Capacity()` and `Size()` as non-const methods. Looking up only the const overloads misses the symbols in `subsdk0`.
+- **Fix:** resolve each getter by the const name first, then by its non-const name. The decoder still requires all three; it uses the guest's methods to read the buffer without assuming its layout.
+- **Found on:** [Ultra Street Fighter II: The Final Challengers (#960)](https://github.com/seedds/nxnative/issues/960).
+
 ### `movie::Decoder` taken over as a MediaCodec-style protocol
 
 - **Symptom:** the game waits forever at a movie (Engage's 94 s opening `S01F.webm`; frames keep presenting, nothing happens).
@@ -38,6 +45,13 @@ The SDK's movie library (`movie::Decoder`, `movie::Extractor`), which the host t
 - **Cause:** SDK 3.5.1's constructor is `Decoder(DecoderType, DecoderOutputFormat)` (`_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE`, `subsdk1+0x2de630`: it builds `DecoderImpl(type, format)`), a third form after [SDK 4's](#sdk-4s-moviedecoder-constructor-without-a-priority): the SDK built its own decoder, as on SDK 4. That SDK has no decoder mode: its decoders work on the CPU. And its output formats are numbered one lower than later SDKs': `DecoderImpl` keeps the format at +0xdc and the type at +0xe0, `ConvertDecoderOutputFormat` (`subsdk1+0x2dd16c`) converts format 2 to ARGB and copies format 3 out as NV12 with stride = width, the UV rows right after the Y rows, and `GetOutputBufferSize` (`subsdk1+0x2dcde8`) gives w × h × 4 for 2 and w × h × 1.5 for 3; format 1 is PCM16 as later. Its `GetOutputBufferSize` also puts 0x20, an alignment, in the second output, where SDK 4 and later put the decoder mode (Metroid Dread `subsdk0+0x11f308`: `str w8,[x2]` with the mode, 1 for the CPU).
 - **Fix:** the two-argument constructor is taken over as a CPU-mode decoder (mode 1) with format 3 as NV12 and 2 as ABGR (`h_movie_Decoder3` in `hle_movie.c`), and its decoders report 0x20 as `GetOutputBufferSize`'s second output (`out_align`). The host's NV12 already has the SDK 3 layout (`md_nv12`).
 - **Found on:** [Hyrule Warriors: Definitive Edition](../../dm/games/0100AE00096EA000/README.md) (SDK 3.5.1, H.264 MP4 movies through its own player): the title's background and the opening movie play.
+
+### The base-object constructors of `movie::Decoder`
+
+- **Symptom:** `CRASH sig=11 addr=0 pc=0` with `lr=h_movie_Configure+…`, as the first movie starts.
+- **Cause:** the host took over only `movie::Decoder`'s complete-object constructors (`C1`). A game that reaches the base-object constructor (`C2`) ran the SDK's: Mario Tennis Aces' SDK 4.5.0 has a `C1` of two instructions (`mov w4,#0; b C2`). The object then held a guest `DecoderImpl`, whose vtable pointer `Configure` read as the host's decoder.
+- **Fix:** `hle_movie.c` takes over the three `C2` forms as well. The class has no virtual bases, so both constructors do the same.
+- **Found on:** Mario Tennis Aces (`0100BDE00862A000`, no profile; [issue #1131](https://github.com/seedds/nxnative/issues/1131), found and tested by its reporter).
 
 ### The complete-object destructor
 
@@ -264,13 +278,13 @@ A decoder hands out as many outputs as it has slots, and while every slot is tak
 - **Check:** `make -C dm/host/tests GAME=<id> run` runs `t_codec_video` (AddressSanitizer and UBSan), which covers the AV1 and SDK 22 forms, native images and the av1C record, and decodes a 64x64 AV1 key frame (SVT-AV1) on each backend the Mac has, read back as NV12.
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): 82 movies in WebM at 2560x1440; the opening's 3,301 pictures play. On #957's branch, VideoToolbox and dav1d gave the same pictures, bit for bit, over the opening's first 600 (about 450 pictures a second each on an M3 Pro), and a tester's M1 Pro played the first two movies through dav1d, smooth and in sync ([seedds/nxnative#927](https://github.com/seedds/nxnative/issues/927)).
 
-### SDK 19's `nn::codec` forms and `TryWaitSyncPointEvent`
+### SDK 19's decoder forms
 
-- **Symptom:** Mario Kart World crashes (pc 0) as its first movie starts; with that fixed, `game called nn::diag abort` as its first course movie (VP9, 2560×1440) begins.
-- **Cause:** SDK 19 (19.3.3 Ounce) has other forms of the decoder calls: `Initialize…Decoder` with two sizes and no work buffer, `Get…DecoderOutputBufferProperties` with an `nn::movie::ColorSpace`, and `sdk::MakeDecodeImagePreferenceForCompat`. Without them the SDK's own code ran on the host decoder (an IPC request on the `DmCV` magic as its session handle). Its VP9 player also polls its sync point event with `nn::syncpt::TryWaitSyncPointEvent`, whose import stayed null. And it aborts on any failure of the properties call, where Donkey Kong Bananza's player polls through 3604: a buffer whose picture is not there yet (a release racing the decode on another thread, once a boot) ended the game.
-- **Fix:** `hle_codec_video.c`: the VP8, VP9 and H.264 forms of both calls (`CV_SDK19`) and the ForCompat preference. The colour space is BT.709 when the stream says so, or says nothing and the picture is at least 720 lines high, else BT.601. A buffer asked for before its picture is waited for up to 100 ms, then reported with the stream's size (`cv_dec_props_cs`). `TryWaitSyncPointEvent` answers whether an armed event's buffer is filled, and for a fired one whether its SystemEvent is signalled. `DM_CV_TRACE=<n>` logs the first n decoder calls.
-- **Check:** `make -C dm/host/tests GAME=<id> run` (`t_codec_video`: the SDK 19 forms, a buffer asked for before its picture, and a polled sync point event).
-- **Found on:** Mario Kart World (`0400C3F00006E000`, no profile yet), 1.0.0: its attract movies and course previews play.
+- **Symptom:** an abort in `nn::codec` (the SDK's own decoder client, which opens a service the host does not have) when a movie starts in a game built with SDK 19 for the Switch 2.
+- **Cause:** SDK 19 names three calls differently from SDK 20 and 22. Initialize by remote memory takes two sizes before the picture size (`…DecoderEPNS0_14Vp9DecoderTypeEmmttj…`). The output buffer properties take a `nn::movie::ColorSpace*` before the time, nine arguments with the index in the first stack slot. The preference has a second form, `nn::codec::sdk::MakeDecodeImagePreferenceForCompat` (fewer output formats, `sdk+0x2c6040`), which the game chooses per decoder (`main+0x19e7860`).
+- **Fix:** `hle_codec_video.c` takes them for VP9, VP8, AV1 and H.264 into the same host decoder. The colour space is written as 0: the 32-bit value the SDK fills in from the service. The game does not read it near either call (`main+0x19e63d4`, `+0x19e702c`), and it converts the NV12 pictures it reads itself.
+- **Check:** `t_codec_video` initializes a VP9 decoder by SDK 19's remote memory form and reads a picture's properties through the nine-argument form.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md)'s base game (SDK 19.3.3 Ounce; its movie player is in `main`), from its imports: the Mushroom Cup's opening (VP9, 2560x1440) decodes with them.
 
 ## Movie players
 

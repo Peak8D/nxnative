@@ -60,7 +60,7 @@ static uint64_t ubc_push(void *d, const void *s, size_t n) {
 }
 
 enum {
-    RO_CB_NEW, RO_CB_BEGIN, RO_CB_END, RO_COMMIT, RO_COMMIT_REAL, RO_SIGNAL, RO_CB_BLOCK,
+    RO_CB_NEW, RO_CB_BEGIN, RO_CB_END, RO_COMMIT, RO_COMMIT_REAL, RO_SIGNAL, RO_CB_BLOCK, RO_Q_BLOCK,
     RO_RE_BEGIN, RO_CE_BEGIN, RO_END,
     RO_BAR_QUEUE, RO_BAR_AFTER_STAGES, RO_BAR_ENCODER,
     RO_R_TABLE, RO_R_PSO, RO_R_DSS, RO_R_VIEWPORT, RO_R_SCISSOR, RO_R_CULL, RO_R_WINDING, RO_R_FILL, RO_R_BIAS, RO_R_CLIP, RO_R_SREF, RO_R_BLEND, RO_R_VIS, RO_R_AMP,
@@ -122,6 +122,7 @@ static void rec_exec(const rec_t *r) {
         if (r->op == RO_COMMIT) g_rx_cb = nil;
         break; }
     case RO_SIGNAL: [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
+    case RO_Q_BLOCK: ((void (^)(void))rec_id(a[0]))(); break;
     case RO_RE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb renderCommandEncoderWithDescriptor:rec_id(a[0])]; break;
     case RO_CE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb computeCommandEncoder]; break;
     case RO_END: [(id<MTL4CommandEncoder>)e endEncoding]; g_rx_enc = nil; break;
@@ -350,4 +351,7 @@ static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
     id<MTL4CommandBuffer> buffers[] = {cb};
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
 }
+// A queue operation (a sparse texture's mapping update, nvn_mtl.m sparse_*): on the encoding thread in its place among the recorded commits, so it reaches the queue before the upload batch
+// committed after it and after the command buffers committed before it
+static void rec_queue_block(void (^block)(void)) { if (rec_on() && g_rb_started) rec_put(RO_Q_BLOCK, 1)->a[0] = rec_obj([block copy]); else block(); }
 static void rec_signal(id ev, uint64_t v) { if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_SIGNAL, 1); r->a[0] = rec_obj(ev); r->a[1] = v; } else [g_q4 signalEvent:ev value:v]; }
