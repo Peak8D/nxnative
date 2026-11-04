@@ -41,6 +41,8 @@ typedef struct {
     uint8_t bw;              // SAMP / SAMPT / SAMPU / SAMPI: a twin sampler for border colours (dmsh_build.py border_emu), its bit in the BORDER block + 1; 0 = an ordinary sampler binding
     uint8_t ubo;             // IMG: the image handle is in uniform slot reg at byte off (img_ubo), not in image slot reg (nvn_mtl.m img_h)
     uint8_t a64;             // IMG: a texture2d<ulong> / texture2d_array<ulong>, the 64-bit image atomics of dmsh_atomic.py merge_atomic64 (an RG32Uint texture: img_atomic_ok)
+    uint8_t reg2;            // TEXU / SAMPU: uniform slot + 1 of the handle's other word, ORed into it (handle type 1, dmsh_build.py "reg2" / "off2"); 0 = one word
+    uint16_t off2;           // TEXU / SAMPU: byte offset of that word
 } nvn_rbind;
 typedef struct {
     int nb, abi, nv;         // Binding count, argument buffer slot, vertex input count

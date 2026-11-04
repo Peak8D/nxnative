@@ -322,6 +322,19 @@ class FloatAtomic(Translated):
 
 
 
+# @P0 LDG.E R2, [R2 + UR4], the predicated uniform form loading into its own address register: Yoshi's instance culling kernel (cff90fc4457d7b71 +0x170,
+# @!P1 LDG R29, [R29 + UR4] after its bounds check) in its encoding, other registers. Zeroing the destination before the address was read loaded element 0
+LDG_P0_R2_UR4 = (0x000f2200081e8907, 0x0000000402027981)
+
+
+class GlobalLoad(Translated):
+    def test_predicated_load_reads_its_address_before_zeroing(self):   # R2 = 0x40: word 16, not word 0 (the STS waits on the load's scoreboard)
+        sts_waiting = waiting((0x000fe80000000800, 0x20 << 40 | 2 << 32 | 0xff << 24 | 0x7388))
+        msl = self.translate(mov(2, 0x40) + inst(*Shared.ISETP_P0) + inst(*ULDC_UR4) + inst(*LDG_P0_R2_UR4) + inst(*sts_waiting) + inst(*EXIT), shared=0x400)
+        self.assertRegex(msl, r'_m0\[16\]')
+        self.assertNotRegex(msl, r'_m0\[0\]')
+
+
 class SharedScale(Translated):
     """A shared access scales Ra by the factor in bits 78..79, whatever its size: 1 [Ra.X4], 2 [Ra.X8], 3 [Ra.X16]. Mario Kart World's froxel shaders keep a float4 a thread
     at [R.X16 + 0x500]; f94552a2a2bff505 stores 8 bytes at [R9.X16] and 4 at [R9.X16 + 8]; Donkey Kong Bananza's upscaler stores 8 bytes at [i.X4 + 0x900]"""

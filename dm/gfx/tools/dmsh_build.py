@@ -815,9 +815,16 @@ def reflect(key, stage, msl, res, layout=None):
             e.update(kind=abi.KIND_SBUF, index=int(re.fullmatch(r'[a-z]+_s(\d+)', nm).group(1)))
         elif decode_ubo_tex(nm[:-5] if nm.endswith('Smplr') else nm):   # bindless: the handle is in a uniform buffer (reg = uniform slot, off = byte offset)
             ut, us = decode_ubo_tex(nm[:-5] if nm.endswith('Smplr') else nm)
-            if nm.endswith('Smplr'): e.update(kind=abi.KIND_SAMP_ID, reg=us[1]) if us[0] == 'id' else e.update(kind=abi.KIND_SAMP_UBO, reg=us[0], off=us[1])
+            # handle type 1: the hardware ORs the two words (texture ID in bits 0..19, sampler ID from bit 20), so each binding names the other word too (reg2 / off2) and the host
+            # reads both. Which word the translator took for the texture follows the game's operand order: Yoshi's FDeferredLightPS has its five G-buffer textures as the
+            # samplers and their shared sampler as the texture, which read texture ID 0 and lit nothing
+            pair = us[0] != 'id' and us != ut
+            if nm.endswith('Smplr'): e.update(kind=abi.KIND_SAMP_ID, reg=us[1]) if us[0] == 'id' else e.update(kind=abi.KIND_SAMP_UBO, reg=us[0], off=us[1], **({'reg2': ut[0], 'off2': ut[1]} if pair else {}))
             elif 'texture_buffer' in ty: e.update(kind=abi.KIND_UNKNOWN)   # bindless typed buffer: not implemented in the replay layer
-            else: e.update(kind=abi.KIND_TEX_UBO, reg=ut[0], off=ut[1])
+            else:
+                e.update(kind=abi.KIND_TEX_UBO, reg=ut[0], off=ut[1], **({'reg2': us[0], 'off2': us[1]} if pair else {}))
+                # a 1D integer fetch read as 2D rows (Program.cs RecordTexelFetch1D, the [bank, word] of the handle): the host binds a texture buffer there as such rows, as for a slot
+                if [ut[0] + 3, ut[1] // 4] in res.get('fetch1d_ubo', ()): e['fetch1d'] = True
         elif decode_ubo_img(nm):   # bindless image: the handle is in a uniform buffer (reg = uniform slot, off = byte offset)
             e.update(kind=abi.KIND_IMG_UBO, reg=decode_ubo_img(nm)[0], off=decode_ubo_img(nm)[1])
             if re.search(r'\b%s\.atomic_' % re.escape(nm), msl): e['atomic'] = True   # as for an image slot (below)

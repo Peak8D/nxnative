@@ -49,6 +49,23 @@ class ImagesInUniformBuffers(unittest.TestCase):
         b = self.reflect_one('texture2d<float, access::write> cp_i_cb4_2_')
         self.assertEqual((b['kind'], b['reg'], b['off'], b.get('atomic')), ('img_ubo', 1, 8, None))
 
+    def test_vertex_buffer_fetch_in_uniform_slot(self):
+        # the vertex factory's Buffer<float> read as 2D rows (Program.cs RecordTexelFetch1D with the handle's bank): the tex_ubo binding is flagged as a slot's would be
+        src = 'struct spvDescriptorSetBuffer0\n{\n    texture2d<float> vp_t_cb3_2 [[id(9)]];\n};\n'
+        b = REFLECT('synthetic', 'vs', src, {'sbufs': [], 'fetch1d_ubo': [[3, 2]]})[0]
+        self.assertEqual((b['kind'], b['reg'], b['off'], b.get('fetch1d')), ('tex_ubo', 0, 8, True))
+        b = REFLECT('synthetic', 'vs', src, {'sbufs': [], 'fetch1d_ubo': [[3, 4]]})[0]
+        self.assertIsNone(b.get('fetch1d'))
+
+    def test_separate_sampler_handle_names_both_words(self):
+        # handle type 1 in c3: texture word 0x16, sampler word 8 as the translator traced them (Yoshi's FDeferredLightPS: a G-buffer texture, words swapped); the host ORs the pair
+        src = 'struct spvDescriptorSetBuffer0\n{\n    texture2d<float> fp_t_cb262147_10020016 [[id(9)]];\n    sampler fp_t_cb262147_10020016Smplr [[id(10)]];\n};\n'
+        t, s = REFLECT('synthetic', 'ps', src, {'sbufs': []})[:2]
+        self.assertEqual((t['kind'], t['reg'], t['off'], t.get('reg2'), t.get('off2')), ('tex_ubo', 0, 88, 0, 32))
+        self.assertEqual((s['kind'], s['reg'], s['off'], s.get('reg2'), s.get('off2')), ('samp_ubo', 0, 32, 0, 88))
+        combined = self.reflect_one('texture2d<float> fp_t_cb3_2')   # type 0: one word, no pair
+        self.assertIsNone(combined.get('off2'))
+
     def test_driver_table_image_stays_a_slot(self):
         b = self.reflect_one('texture2d<float, access::write> fp_i_cb2_48_')
         self.assertEqual((b['kind'], b['reg']), ('img', 0))

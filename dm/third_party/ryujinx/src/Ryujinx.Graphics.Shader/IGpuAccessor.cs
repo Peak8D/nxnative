@@ -461,6 +461,16 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: the same for a handle in a constant buffer other than the driver table (cbufSlot), the game's own uniform buffer (Yoshi's UE5 vertex fetch: c[3])
+        /// </summary>
+        /// <param name="handle">Texture handle</param>
+        /// <param name="cbufSlot">Constant buffer of the handle (TextureOperation.DefaultCbufSlot: the driver table)</param>
+        void RecordTexelFetch1D(int handle, int cbufSlot)
+        {
+            RecordTexelFetch1D(handle);
+        }
+
+        /// <summary>
         /// nxnative: whether a word of the driver's handle table (c[2], at this byte offset) holds a separate sampler's handle, which names no texture
         /// </summary>
         /// <param name="byteOffset">Byte offset in c[2]</param>

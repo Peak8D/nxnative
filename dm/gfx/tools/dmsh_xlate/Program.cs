@@ -77,7 +77,8 @@ static class SwshXlate
         public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
-        public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
+        // Past the code area: empty, which ends a jump table there (DecoderAmpere FindBrxTargetsAmpere reads c1's entries until one names no code; Yoshi's Lumen ScreenProbeIntegrateCS: a slice past the end threw)
+        public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => address >= (ulong)_code.Length ? ReadOnlySpan<ulong>.Empty : MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         // A texture read whose handle the translator cannot trace to one slot indexes the texture and sampler pools by the handle's IDs (20 and 12 bits); dmsh_build.py turns these
         // arrays into pointers to the pools the replay keeps (pool_arrays), with a run-time bound, so the lengths are the whole ID ranges
         public int QuerySamplerArrayLengthFromPool() => 1 << 12;
@@ -131,6 +132,10 @@ static class SwshXlate
         // which only the bound descriptor tells (res "fetch1d"; dmsh_build.py flags their bindings, and the host binds a texture buffer there as 16384-texel rows, nvn_mtl.m tbuf_as_2d)
         public readonly SortedSet<int> Fetch1D = new();
         public void RecordTexelFetch1D(int handle) { int slot = Slot(handle, -1, false); if (slot >= 0) Fetch1D.Add(slot); }
+        // A handle in the game's own uniform buffer (bank 3 and up: Yoshi's UE5 vertex factories fetch their vertex buffers so, the handle at c[3] word 0, 2 or 4) is the bank and word
+        // of its tex_ubo binding (res "fetch1d_ubo": [bank, word] pairs; dmsh_build.py flags that binding as it flags a slot's)
+        public readonly SortedSet<(int, int)> Fetch1DUbo = new();
+        public void RecordTexelFetch1D(int handle, int cbufSlot) { int bank = cbufSlot & 0xffff; if (cbufSlot < 0 || bank == 2) RecordTexelFetch1D(handle); else Fetch1DUbo.Add((bank, handle & 0x3fff)); }
         public TextureFormat QueryTextureFormat(int handle, int cbufSlot = -1)
         {
             int slot = Slot(handle, cbufSlot, true);
@@ -237,6 +242,7 @@ static class SwshXlate
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add(new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 if (acc.Fetch1D.Count > 0) { var f1 = new JsonArray(); foreach (int h in acc.Fetch1D) f1.Add(h); res["fetch1d"] = f1; }
+                if (acc.Fetch1DUbo.Count > 0) { var f2 = new JsonArray(); foreach ((int bank, int word) in acc.Fetch1DUbo) f2.Add(new JsonArray(bank, word)); res["fetch1d_ubo"] = f2; }
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 ok++;
             }

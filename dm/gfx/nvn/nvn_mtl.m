@@ -4252,15 +4252,50 @@ static NvShader *builtin_get(const char *ctl) {
     }
     return nil;
 }
+// On-demand shaders (DM_NVN_DEMAND=1: the Mac's bring-up of a game whose library is partial, dm/gfx/tools/dmsh_demand.py beside the host). A full library of a large map takes hours
+// (Yoshi: 133,154 shaders, 2.5 hours on an M4 Pro), and every change of the translation chain starts it over. Here a program stage with no library asks for its key once, in
+// <library dir>/demand.txt (key, stage), and its program is built without it (the draws that need the stage are left out, as for any missing shader); dmsh_demand.py builds the
+// keys asked for with dmsh_build.py into the same library. Every 250 ms the keys still waited for are looked up: a reflection json (dmsh_build.py writes it after the libraries)
+// takes the programs built without a stage out of the serial table, so their next use builds them with what is there; <key>.demand_failed ends the wait for a key that did not build
+static int demand_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DEMAND"); v = e && *e && strcmp(e, "0") ? 1 : 0; if (v) MLOG("on-demand shaders: missing keys go to %s/demand.txt (dmsh_demand.py builds them)", g_msl_dir.UTF8String); } return v; }
+static NSMutableSet<NSString *> *g_dm_asked; static NSMutableArray<NSString *> *g_dm_wait;   // the keys asked for; those not yet built or failed
+static uint64_t *g_dm_ser; static int g_dm_nser, g_dm_cap; static uint64_t g_dm_last;   // serials of the programs built without a stage; the last look-up
+static void demand_ask(NSString *k, NSString *stage) {
+    if (!g_dm_asked) { g_dm_asked = [NSMutableSet set]; g_dm_wait = [NSMutableArray array]; }
+    if ([g_dm_asked containsObject:k]) return;
+    [g_dm_asked addObject:k]; [g_dm_wait addObject:k];
+    FILE *f = fopen([g_msl_dir stringByAppendingPathComponent:@"demand.txt"].fileSystemRepresentation, "a");
+    if (f) { fprintf(f, "%s\t%s\n", k.UTF8String, stage.UTF8String); fclose(f); } else { static int once; if (!once++) MLOG("[RED] on-demand shaders: cannot write %s/demand.txt", g_msl_dir.UTF8String); }
+}
+static void demand_note(uint64_t serial) {
+    for (int i = 0; i < g_dm_nser; i++) if (g_dm_ser[i] == serial) return;
+    if (g_dm_nser == g_dm_cap) { g_dm_cap = g_dm_cap ? 2 * g_dm_cap : 64; g_dm_ser = realloc(g_dm_ser, sizeof *g_dm_ser * g_dm_cap); if (!g_dm_ser) { g_dm_cap = g_dm_nser = 0; return; } }
+    g_dm_ser[g_dm_nser++] = serial;
+}
+static void demand_poll(void) {
+    if (!g_dm_wait.count) return;
+    uint64_t t = bp_now(); if (t - g_dm_last < 250000000ull) return; g_dm_last = t;
+    NSFileManager *fm = [NSFileManager defaultManager]; int ready = 0;
+    for (NSInteger i = (NSInteger)g_dm_wait.count - 1; i >= 0; i--) {
+        NSString *k = g_dm_wait[(NSUInteger)i];
+        if ([fm fileExistsAtPath:[NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, k]]) { ready++; [g_dm_wait removeObjectAtIndex:(NSUInteger)i]; }
+        else if ([fm fileExistsAtPath:[NSString stringWithFormat:@"%@/%@.demand_failed", g_msl_dir, k]]) { MLOG("[RED] on-demand shader %s did not build (see dmsh_demand.py's output)", k.UTF8String); [g_dm_wait removeObjectAtIndex:(NSUInteger)i]; }
+    }
+    if (!ready) return;
+    static uint64_t n; n += ready; MLOG("on-demand shaders: %d more built (%llu in all, %lu still waited for); %d programs built again at their next use", ready, n, (unsigned long)g_dm_wait.count, g_dm_nser);
+    for (int i = 0; i < g_dm_nser; i++) serial_del(g_dm_ser[i]);   // a deferred release, as when the game finalizes a program; the next prog_get builds it again
+    g_dm_nser = 0;
+}
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // Last result: same object, same serial and unchanged serial table means it is used directly
+    if (demand_on()) demand_poll();   // before the generation is read: a finished key takes programs out of the table
     uint64_t gen = g_ser_gen;
     if (p == lp && p->serial == lser && gen == lgen && lpr) return lpr;
     __unsafe_unretained NvProg *have = p->serial ? serial_get(p->serial) : nil;
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
     shmap_load();
-    NvProg *o = [NvProg new];
+    NvProg *o = [NvProg new]; int incomplete = 0;
     for (unsigned i = 0; i < p->nstage; i++) {
         // Key = sha256(first 0x880 bytes of the control section + code area): many of Mario's shaders share a control section but differ in code (dm/gfx/tools/shader_split.py). It was computed at SetShaders (hle_nvn.c): by now the game may have freed the control section
         uint8_t md[8]; prog_key(p, i, md);
@@ -4280,11 +4315,14 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         }
         int st = stage_of(stage);
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
-        if (sh) o->sh[st] = sh; else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
+        if (sh) o->sh[st] = sh;
+        else if (st >= 0 && demand_on()) { demand_ask(k, stage); incomplete = 1; }
+        else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
         if (!sh && st == 2) strlcpy(o->gs_miss, k.UTF8String, sizeof o->gs_miss);
     }
     prog_fold_gs(o);   // a slice-writing geometry shader: the vertex shader's layer entry points instead
     if (p->serial) serial_put(p->serial, o);
+    if (incomplete && p->serial) demand_note(p->serial);   // built again once a key it waits for is built (demand_poll)
     return o;
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
@@ -7467,11 +7505,29 @@ static void ubo_read(int stage, int reg, int off, size_t n, void *out) {
     memcpy(out, base + mo, n);
 }
 static uint32_t ubo_handle(int stage, int reg, int off) { uint32_t h; ubo_read(stage, reg, off, 4, &h); return h; }
+// The handle of a TEXU / SAMPU binding with a separate sampler word (handle type 1, reg2 / off2): the texture ID from the texture word and the sampler ID from the sampler word, as
+// the game's masks take them ((t & 0xfffff) | (s & 0xfff00000), BindlessElimination's masked pattern: Yoshi's title screen and sky, whose words carry the other part too), and a part
+// that is zero from the other word, as a plain OR of the two reads it: there the translator takes the operands in the game's order, and Yoshi's FDeferredLightPS has its five
+// G-buffer textures as the samplers and their shared sampler as the texture
+static uint32_t ubo_handle_b(int stage, const nvn_rbind *b) {
+    uint32_t h = ubo_handle(stage, b->reg, b->off); if (!b->reg2) return h;
+    uint32_t o = ubo_handle(stage, b->reg2 - 1, b->off2), t = b->kind == NVN_RB_SAMPU ? o : h, s = b->kind == NVN_RB_SAMPU ? h : o;
+    return (t & 0xfffff ? t & 0xfffff : s & 0xfffff) | (s & 0xfff00000u ? s & 0xfff00000u : t & 0xfff00000u);
+}
 // A handle read from a uniform buffer names IDs of the pools bound when the draw runs: as bound handles are moved at recording (hle_nvn.c bind_handles), these take the bases here (0 = none)
 static int ubo_tex_id(uint32_t h) { int t = (int)(h & 0xfffff); return t ? t + S.tex_base : 0; }
 static int ubo_samp_id(uint32_t h) { int s = (int)(h >> 20); return s ? s + S.samp_base : 0; }
 // An image binding's handle at the draw: its image slot's, or for an image whose handle the game keeps in its own uniform buffer (img_ubo: Yoshi's UE5 compute and material
 // shaders, c[3]) the word there, its texture ID moved to the bound pool's part of the table as bound image handles are (bind_handles)
+// DM_NVN_CBDUMP with DM_NVN_CBDUMP_KEY: also a keyed shader's buffer textures and image buffers as bound (F<frame>_p<pass>_st<stage>_tb<argument>_<texture ID>.bin), whose
+// typed buffers (a UE5 instance culling pass's inputs and counters) the uniform blocks alone do not show
+static void cbd_tbuf(const char *key, int stage, int aid, int tid, id<MTLTexture> t) {
+    static const char *cbd, *cbk; static int init; if (!init) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); init = 1; }
+    if (!passdump() || !cbd || !cbk || strcmp(key, cbk) || !t || !t.buffer || !t.buffer.contents || tid <= 0 || tid >= g_ntreg) return;
+    int bw, bh; size_t bpe = (size_t)nvn_fmt_bpb(g_treg[tid].t.d.format, &bw, &bh), n = MIN((size_t)t.width * (bpe ? bpe : 4), t.buffer.length - t.bufferOffset);
+    char p[1024]; snprintf(p, sizeof p, "%s/F%llu_p%llu_st%d_tb%d_%d.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, stage, aid, tid);
+    FILE *f = fopen(p, "wb"); if (f) { fwrite((const uint8_t *)t.buffer.contents + t.bufferOffset, 1, n, f); fclose(f); }
+}
 static uint64_t img_h(const nvn_rbind *b, int stage, const uint64_t *img) {
     if (b->ubo) return stage >= 0 && stage < 6 ? (uint64_t)ubo_tex_id(ubo_handle(stage, b->reg, b->off)) : 0;
     return b->reg < 32 ? img[b->reg] : 0;
@@ -7568,11 +7624,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             }
             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
-            int sid = b->kind == NVN_RB_SAMPU ? ubo_samp_id(ubo_handle(nvn_stage, reg, b->off)) :
+            int sid = b->kind == NVN_RB_SAMPU ? ubo_samp_id(ubo_handle_b(nvn_stage, b)) :
                       b->kind == NVN_RB_SAMPI ? (int)reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;   // SAMPI: a sampler ID the shader names as a constant
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
             // the texture of the same combined handle a rectangle view (see tex_is_rect): its sampler in texel coordinates
-            int rtid = b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(tex_slot_h(S.tex[nvn_stage], S.img[nvn_stage], reg) & 0xfffff) : 0) : b->kind == NVN_RB_SAMPU ? ubo_tex_id(ubo_handle(nvn_stage, reg, b->off)) : 0;
+            int rtid = b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(tex_slot_h(S.tex[nvn_stage], S.img[nvn_stage], reg) & 0xfffff) : 0) : b->kind == NVN_RB_SAMPU ? ubo_tex_id(ubo_handle_b(nvn_stage, b)) : 0;
             __unsafe_unretained id<MTLSamplerState> sr = ss && rtid && tex_is_rect(rtid) ? samp_rect(sid) : nil;
             if (sr) { ss = sr; slots[aid] = g_srid_r[sid]; }
             else if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
@@ -7584,7 +7640,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d (0 nearest / 1 linear; 2–5 with mips) wrap=%d,%d,%d border=%g,%g,%g,%g lod=%g..%g bias=%g aniso=%g cmp=%d/%d %s", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf,
                            (int)sp.ws, (int)sp.wt, (int)sp.wr, sp.border[0], sp.border[1], sp.border[2], sp.border[3], sp.lod_min, sp.lod_max, sp.lod_bias, sp.aniso, (int)sp.cmp_mode, (int)sp.cmp_func, ss ? "real" : "failed"); }
         } else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TEXU) {
-            int tid = b->kind == NVN_RB_TEXU ? ubo_tex_id(ubo_handle(nvn_stage, reg, b->off)) : (int)(tex_slot_h(S.tex[nvn_stage], S.img[nvn_stage], reg) & 0xfffff);
+            int tid = b->kind == NVN_RB_TEXU ? ubo_tex_id(ubo_handle_b(nvn_stage, b)) : (int)(tex_slot_h(S.tex[nvn_stage], S.img[nvn_stage], reg) & 0xfffff);
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             int snap = fb_snapshot_slot(nvn_stage, t);
             if (snap >= 0) { t = g_fb_use[snap]; trid = g_fb_rid[snap]; }
@@ -7593,6 +7649,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType, t ? (int)t.swizzle.red : 0, t ? (int)t.swizzle.green : 0, t ? (int)t.swizzle.blue : 0, t ? (int)t.swizzle.alpha : 0, (__bridge void *)(t.parentTexture ? t.parentTexture : t));
+            cbd_tbuf(sh->key, nvn_stage, b->aid, tid, t);
             if (t && b->f1d && t.textureType == MTLTextureTypeTextureBuffer && (MTLTextureType)b->dtt == MTLTextureType2D) { uint64_t r2 = 0; id<MTLTexture> v = tbuf_as_2d(tid, t, b->dpf, &r2); if (v) { t = v; trid = r2; } }   // see tbuf_as_2d
             if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit(tid, t, (MTLTextureType)b->dtt, &r2); if (v) { t = v; trid = r2; }
                 // no view fits, and one side is a buffer texture (Octopath Traveler 0: a buffer texture left in a slot a shader reads as a cube): reads of it are undefined, so the slot reads 0
@@ -7606,6 +7663,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             int tid = (int)(img_h(b, nvn_stage, S.img[nvn_stage]) & 0xfffff);
             uint64_t trid; int real;
             id<MTLTexture> t = img_binding(tid, b, &trid, &real);
+            if (real) cbd_tbuf(sh->key, nvn_stage, b->aid, tid, t);
             int snap = real && g_fb_n && !b->rw && !b->atom && fb_image_view(tid, b, t) ? fb_snapshot_slot(nvn_stage, t) : -1;
             if (snap >= 0) { t = g_fb_use[snap]; trid = g_fb_rid[snap]; }
             if (b->atom && !img_atomic_ok(t, b)) {   // see dummy_img_atomic; an unbound slot's write sink is not atomic-capable either
@@ -7696,6 +7754,13 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (addr && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw) sbw_note(addr, sbw_len(0, mb, mo), SBW_GPU); }   // size not known
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufu reg%d+%#x addr=%#llx %s", g_stat_pass, nvn_stage, reg, b->off, (unsigned long long)addr, b->rw ? "rw" : "ro");
+            // DM_NVN_CBDUMP with DM_NVN_CBDUMP_KEY: also the storage buffer's first MB from its address on (F<frame>_p<pass>_st<stage>_sbu<off>_<address>.bin): a UE5 vertex factory's
+            // GPU Scene data (instance and primitive records) is read so, and the uniform blocks alone do not tell whether it holds anything
+            { static const char *cbd, *cbk; static int cbd_init; if (!cbd_init) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); cbd_init = 1; }
+              if (bl && cbd && cbk && addr && !strcmp(sh->key, cbk) && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) {
+                id<MTLBuffer> sb = (__bridge id<MTLBuffer>)mb; size_t n = sb.length > mo ? MIN((size_t)(sb.length - mo), (size_t)1 << 20) : 0;
+                char p[1024]; snprintf(p, sizeof p, "%s/F%llu_p%llu_st%d_sbu%x_%llx.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, nvn_stage, b->off, (unsigned long long)addr);
+                FILE *f = n && sb.contents ? fopen(p, "wb") : NULL; if (f) { fwrite((const uint8_t *)sb.contents + mo, 1, n, f); fclose(f); } } }
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
             id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
@@ -10668,6 +10733,7 @@ static void dispatch(const p_dispatch *dp) {
             [(id<MTL4ComputeCommandEncoder>)ce barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:resource_vis()]; }
         enc_c_dispatch_indirect(ce, ig, MTLSizeMake(tg[0], tg[1], tg[2]));
     } else enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
+    if (passdump()) PD("E %llu dispatch %s groups=%u,%u,%u threads=%u,%u,%u%s", g_stat_pass, cs->key, (unsigned)dp->x, (unsigned)dp->y, (unsigned)dp->z, (unsigned)tg[0], (unsigned)tg[1], (unsigned)tg[2], dp->ind ? " indirect (the groups are GPU-written)" : "");
     if (own) enc_c_end(ce);
 }
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, layer stride from SetCopyImageStride, 0 = tightly packed)

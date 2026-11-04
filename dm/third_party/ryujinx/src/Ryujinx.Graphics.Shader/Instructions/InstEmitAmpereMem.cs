@@ -47,6 +47,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0xf66, InstName.Tld, ATex, InstProps.Tex);   // TLD through a handle in a uniform register, as 0xf60 for TEX (Fast Fusion's terrain vertex shaders)
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
             x(0xf63, InstName.Tld4, ATex, InstProps.Tex);   // TLD4 through a handle in a uniform register, as 0xf60 for TEX (Star Fox's pixel shaders)
+            x(0x364, InstName.Tld4, ATex, InstProps.Tex);   // TLD4 through a handle in a register, as 0x361 for TEX (Yoshi: DiaphragmDOF's RecombineMainCS, the water base pass)
             x(0xb69, InstName.Tmml, ATex, InstProps.Tex);
             x(0xb6c, InstName.Txd, ATex, InstProps.Tex);
             x(0xf6c, InstName.Txd, ATex, InstProps.Tex);   // TXD through a handle in a uniform register, as 0xf60 for TEX (Star Fox: 294 shaders)
@@ -303,6 +304,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 }
             }
 
+            // The address is read once, before any result is written, the predicated form's zeroes included (the destination may be the address register:
+            // LDG.128 R0, [R0.64]; Yoshi's instance culling kernel loads @!P1 LDG R29, [R29 + UR4], and zeroed first, every such load read element 0)
+            (Operand[] los, Operand[] his) = (new Operand[count], new Operand[count]);
+
+            for (int index = 0; index < count; index++)
+            {
+                (los[index], his[index]) = AGlobalAddress(context, x, 90, 32, index * 4);
+            }
+
             Operand lblSkip = null;
 
             if (pred != null)
@@ -314,14 +324,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                 lblSkip = Label();
                 context.BranchIfFalse(lblSkip, pred);
-            }
-
-            // The address is read once, before any result is written (the destination may be the address register: LDG.128 R0, [R0.64])
-            (Operand[] los, Operand[] his) = (new Operand[count], new Operand[count]);
-
-            for (int index = 0; index < count; index++)
-            {
-                (los[index], his[index]) = AGlobalAddress(context, x, 90, 32, index * 4);
             }
 
             for (int index = 0; index < count; index++)
@@ -685,7 +687,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // handle from there, as for Maxwell's TEX.B. The other fields are 0xb60's. 0xf60: a uniform register at 40..46. 0x361 (bit 59 set): a register, the first of the second source block,
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
-            bool handleInB = opcode == 0x361;
+            bool handleInB = opcode == 0x361 || opcode == 0x364;   // 0x364: TLD4's, laid out as 0x361 is to TEX
             bool bindless = handleInB || opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c;
 
             if (opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c)
@@ -697,7 +699,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = opcode switch { 0xf63 => 0xb63, 0xf66 => 0xb66, 0xf6c => 0xb6c, _ => 0xb60 };
+                opcode = opcode switch { 0xf63 or 0x364 => 0xb63, 0xf66 => 0xb66, 0xf6c => 0xb6c, _ => 0xb60 };
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));
@@ -858,7 +860,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                             Operand fetchX = sources[^1];
                             sources[^1] = context.BitwiseAnd(fetchX, Const(0x3FFF));
                             sources.Add(context.ShiftRightU32(fetchX, Const(14)));
-                            context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle);
+                            context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle, cbufSlot);
                         }
                         else
                         {
@@ -961,7 +963,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                         Operand x0 = sources[0];
                         sources[0] = context.BitwiseAnd(x0, Const(0x3FFF));
                         sources.Insert(1, context.ShiftRightU32(x0, Const(14)));
-                        context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle);
+                        context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle, cbufSlot);
                         type = SamplerType.Texture2D;
                     }
                 }

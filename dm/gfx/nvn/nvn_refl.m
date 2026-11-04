@@ -66,9 +66,11 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@DMSH_KIND_TEX]) { r->kind = NVN_RB_TEX; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); r->f1d = [b[@"fetch1d"] boolValue]; }
             // An array of them (array<element, n>): the handles of a uniform buffer the shader indexes at run time (Ryujinx's texture array from a buffer, handle 0: the index is the handle's
             // byte offset ÷ 8, an NVN handle being 64-bit). Paper Mario: The Thousand-Year Door's reflection shaders: array<texture2d<float>, 32> fp_t2d_cb14_0, the handles of uniform slot 11
-            else if ([k isEqualToString:@DMSH_KIND_TEX_UBO]) { r->kind = NVN_RB_TEXU; dummy_kind(el, &r->dtt, &r->dpf); r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1;
+            else if ([k isEqualToString:@DMSH_KIND_TEX_UBO]) { r->kind = NVN_RB_TEXU; dummy_kind(el, &r->dtt, &r->dpf); r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1; r->f1d = [b[@"fetch1d"] boolValue];
+                if (b[@"off2"]) { r->reg2 = (uint8_t)([b[@"reg2"] intValue] + 1); r->off2 = (uint16_t)[b[@"off2"] intValue]; }
                 if (n) { if (n > 32) FAIL("B binding %s: array of %d", nm.UTF8String, n); r->n = (uint8_t)n; } }
             else if ([k isEqualToString:@DMSH_KIND_SAMP_UBO]) { r->kind = NVN_RB_SAMPU; r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1;
+                if (b[@"off2"]) { r->reg2 = (uint8_t)([b[@"reg2"] intValue] + 1); r->off2 = (uint16_t)[b[@"off2"] intValue]; }
                 if (n) { if (n > 32) FAIL("B binding %s: array of %d", nm.UTF8String, n); r->n = (uint8_t)n; } }
             else if ([k isEqualToString:@DMSH_KIND_SAMP_ID]) r->kind = NVN_RB_SAMPI;
             // The pools, indexed by the handle's IDs (nvn_refl.h TEXP / SAMPP): which texture is read is known only when the GPU runs the draw
