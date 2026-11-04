@@ -9,6 +9,7 @@ METAL = ['xcrun', '-sdk', 'iphoneos', 'metal', '-c', '-O1', '-mios-version-min=1
 METALLIB = ['xcrun', '-sdk', 'iphoneos', 'metallib']
 RECORD = ' '.join(METAL) + '; ' + ' '.join(METALLIB)                                # Written into json chain.metal
 
-def compile(msl, air, lib):
-    subprocess.run([*METAL, msl, '-o', air], check=True)
+def compile(msl, air, lib):   # a vertex shader marked with dmsh_build.py VS_STRICT_FP compiles in the safe math mode (positions agree across a pre-pass and its base pass)
+    strict = open(msl).read(16) == '// dmsh: vertex '
+    subprocess.run([*(a if not strict or a != '-fmetal-math-mode=relaxed' else '-fmetal-math-mode=safe' for a in METAL), msl, '-o', air], check=True)
     subprocess.run([*METALLIB, air, '-o', lib], check=True)

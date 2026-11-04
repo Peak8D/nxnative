@@ -4152,6 +4152,9 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     for (NSString *f in [ext componentsSeparatedByString:@" "]) { int r = 0, n = 0;
         if (sscanf(f.UTF8String, "%d:%d", &r, &n) == 2 && r >= 0 && r < 16 && n > 0) o->cb_ext[r] = (uint32_t)n;
         else if (sscanf(f.UTF8String, "s%d", &r) == 1 && r >= 0 && r < 32) o->sb_ro |= 1u << r; }
+    // Without a table entry, the extents the build wrote into the reflection json (dmsh_build.py "cb_ext"): a library built in parts (dmsh_demand.py) has no cb_extent.tsv
+    if (!ext && [j[@"cb_ext"] isKindOfClass:[NSDictionary class]])
+        for (NSString *r in j[@"cb_ext"]) { int ri = r.intValue, n = [j[@"cb_ext"][r] intValue]; if (ri >= 0 && ri < 16 && n > 0) o->cb_ext[ri] = (uint32_t)n; }
     return o;
 }
 // The part of uniform slot reg's binding the shader can read: its first cb_ext bytes when cb_extent.tsv bounds them, else the whole binding
@@ -7521,9 +7524,20 @@ static int ubo_samp_id(uint32_t h) { int s = (int)(h >> 20); return s ? s + S.sa
 // shaders, c[3]) the word there, its texture ID moved to the bound pool's part of the table as bound image handles are (bind_handles)
 // DM_NVN_CBDUMP with DM_NVN_CBDUMP_KEY: also a keyed shader's buffer textures and image buffers as bound (F<frame>_p<pass>_st<stage>_tb<argument>_<texture ID>.bin), whose
 // typed buffers (a UE5 instance culling pass's inputs and counters) the uniform blocks alone do not show
+// DM_NVN_CBDUMP=<dir> with DM_NVN_CBDUMP_KEY=<key>[,<key>...]: the dump directory for a shader of the list, else NULL (no list: any shader when any is true). Both are read again
+// at each frame, so DM_CTL's "env" changes them in a running game
+static const char *cbdump_dir(const char *key, int any) {
+    static const char *cbd, *cbk; static uint64_t at = UINT64_MAX; uint64_t f = atomic_load(&g_cur_frame);
+    if (f != at) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); at = f; }
+    if (!cbd || !key) return NULL;
+    if (!cbk) return any ? cbd : NULL;
+    size_t n = strlen(key);
+    for (const char *q = cbk; (q = strstr(q, key)); q += n) if ((q == cbk || q[-1] == ',') && (q[n] == 0 || q[n] == ',')) return cbd;
+    return NULL;
+}
 static void cbd_tbuf(const char *key, int stage, int aid, int tid, id<MTLTexture> t) {
-    static const char *cbd, *cbk; static int init; if (!init) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); init = 1; }
-    if (!passdump() || !cbd || !cbk || strcmp(key, cbk) || !t || !t.buffer || !t.buffer.contents || tid <= 0 || tid >= g_ntreg) return;
+    const char *cbd = passdump() ? cbdump_dir(key, 0) : NULL;
+    if (!cbd || !t || !t.buffer || !t.buffer.contents || tid <= 0 || tid >= g_ntreg) return;
     int bw, bh; size_t bpe = (size_t)nvn_fmt_bpb(g_treg[tid].t.d.format, &bw, &bh), n = MIN((size_t)t.width * (bpe ? bpe : 4), t.buffer.length - t.bufferOffset);
     char p[1024]; snprintf(p, sizeof p, "%s/F%llu_p%llu_st%d_tb%d_%d.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, stage, aid, tid);
     FILE *f = fopen(p, "wb"); if (f) { fwrite((const uint8_t *)t.buffer.contents + t.bufferOffset, 1, n, f); fclose(f); }
@@ -7591,12 +7605,12 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;
                 else RED_ONCE(92, "a uniform update deferred inside the pass covers only part of the binding (stage %d cb%d): the content before the update is read", nvn_stage, reg); }
             if (bl) {
-                PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
+                PD("B %llu st%d cb reg%d addr=%#llx size=%llu ext=%u pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size, sh->cb_ext[reg],
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
                 // DM_NVN_CBDUMP=directory: also saves the whole uniform block to disk as-is (F<frame>_p<pass>_st<stage>_cb<slot>_<address>.bin), for the ground-truth side to compare byte by byte by guest address
                 // DM_NVN_CBDUMP_KEY=shader key: only save for draws using that shader (any stage)
-                static const char *cbd, *cbk; static int cbd_init; if (!cbd_init) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); cbd_init = 1; }
-                if (cbd && (!cbk || !strcmp(sh->key, cbk))) {
+                const char *cbd = cbdump_dir(sh->key, 1);
+                if (cbd) {
                     char p[1024]; snprintf(p, sizeof p, "%s/F%llu_p%llu_st%d_cb%d_%llx.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr);
                     FILE *f = fopen(p, "wb"); if (f) { fwrite((const void *)u->addr, 1, u->size, f); fclose(f); } else RED_ONCE(41, "CBDUMP cannot write %s", p);
                 }
@@ -7756,8 +7770,8 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (bl) PD("B %llu st%d sbufu reg%d+%#x addr=%#llx %s", g_stat_pass, nvn_stage, reg, b->off, (unsigned long long)addr, b->rw ? "rw" : "ro");
             // DM_NVN_CBDUMP with DM_NVN_CBDUMP_KEY: also the storage buffer's first MB from its address on (F<frame>_p<pass>_st<stage>_sbu<off>_<address>.bin): a UE5 vertex factory's
             // GPU Scene data (instance and primitive records) is read so, and the uniform blocks alone do not tell whether it holds anything
-            { static const char *cbd, *cbk; static int cbd_init; if (!cbd_init) { cbd = getenv("DM_NVN_CBDUMP"); cbk = getenv("DM_NVN_CBDUMP_KEY"); cbd_init = 1; }
-              if (bl && cbd && cbk && addr && !strcmp(sh->key, cbk) && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) {
+            { const char *cbd = bl ? cbdump_dir(sh->key, 0) : NULL;
+              if (cbd && addr && mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) {
                 id<MTLBuffer> sb = (__bridge id<MTLBuffer>)mb; size_t n = sb.length > mo ? MIN((size_t)(sb.length - mo), (size_t)1 << 20) : 0;
                 char p[1024]; snprintf(p, sizeof p, "%s/F%llu_p%llu_st%d_sbu%x_%llx.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, nvn_stage, b->off, (unsigned long long)addr);
                 FILE *f = n && sb.contents ? fopen(p, "wb") : NULL; if (f) { fwrite((const uint8_t *)sb.contents + mo, 1, n, f); fclose(f); } } }
@@ -10398,9 +10412,10 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (g_sm_pass && g_sm_applied != g_sm_cur) {   // the layer this draw goes to (see g_sm_plan)
         MTLVertexAmplificationViewMapping vm = {0, (uint32_t)(g_sm_cur - g_sm_lo)}; [(id<MTL4RenderCommandEncoder>)en setVertexAmplificationCount:1 viewMappings:&vm]; g_sm_applied = g_sm_cur; }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
-    // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix,...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged
-    static char dko[8][24]; static int ndko = -1;
-    if (ndko < 0) { ndko = 0; const char *e = getenv("DM_NVN_DEPTHOVR");
+    // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix,...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged.
+    // Read again at each frame, so DM_CTL's "env" turns it on and off in a running game
+    static char dko[8][24]; static int ndko = 0; static uint64_t dko_at = UINT64_MAX; uint64_t dko_f = atomic_load(&g_cur_frame);
+    if (dko_f != dko_at) { dko_at = dko_f; ndko = 0; const char *e = getenv("DM_NVN_DEPTHOVR");
         for (const char *q = e; q && *q && ndko < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(dko[ndko], q, n); dko[ndko++][n] = 0; } }
     if (ndko) { int ovr = 0; for (int i = 0; i < ndko && pr->sh[1]; i++) ovr |= !strncmp(pr->sh[1]->key, dko[i], strlen(dko[i]));
         unsigned df0 = (unsigned)S.ds.df; if (ovr) S.ds.df = 8; cur_ds = dss_get(g_pass.hd, g_pass.hs); S.ds.df = df0; cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
@@ -10503,8 +10518,8 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
                               st < 16 ? S.stream[st].stride : 0, st < 16 ? S.stream[st].divisor : 0, st < 16 ? (unsigned long long)S.vbuf[st].address : 0ull, st < 16 ? (unsigned long long)S.vbuf[st].size : 0ull); }
             PD("v %llu %s", g_stat_pass, vb);
             // DM_NVN_CBDUMP + DM_NVN_CBDUMP_KEY=vertex shader key: also save that draw's vertex streams and indices (F<frame>_p<pass>_vb<stream>_<address>.bin / _ib_<address>.bin)
-            const char *cbd = getenv("DM_NVN_CBDUMP"), *cbk = getenv("DM_NVN_CBDUMP_KEY");
-            if (cbd && cbk && pr->sh[0] && !strcmp(pr->sh[0]->key, cbk)) {
+            const char *cbd = pr->sh[0] ? cbdump_dir(pr->sh[0]->key, 0) : NULL;
+            if (cbd) {
                 char fp[1024];
                 for (int st = 0; st < 16; st++) if (S.vbuf[st].address && S.vbuf[st].size) {
                     snprintf(fp, sizeof fp, "%s/F%llu_p%llu_vb%d_%llx.bin", cbd, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, st, (unsigned long long)S.vbuf[st].address);
