@@ -830,6 +830,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - geometry preparation dominates rendering CPU even after geometry passes have been batched; primitive assembly and capture-index deduplication repeat for unchanged meshes. → [Prepared geometry indices reused after byte comparison](../reference/shaders.md#prepared-geometry-indices-reused-after-byte-comparison)
 - geometry vertex-capture passes consume substantial GPU time before geometry compute or depth rasterization. → [Geometry capture initializes only missing words](../reference/shaders.md#geometry-capture-initializes-only-missing-words)
 - Apple's performance HUD (`DM_METAL_HUD=1`) says `Compiled 2 shaders. Total compilation time is 102.70ms. Consider adopting MTL4Compiler for more fine grained compilations` during play, with a dip in the frame-rate graph at that moment, for example when a new room first issues a scissored clear. → [The host's own shaders compiled from source at run time](../reference/shaders.md#the-hosts-own-shaders-compiled-from-source-at-run-time)
+- `[RED] failed to create render pipeline (vertex <vs> fragment <fs>): pipeline descriptor is invalid: depthAttachmentPixelFormat is not valid and shader writes to depth`. Render pass aborts or crashes when drawing colour-only passes with a fragment shader that writes `gl_FragDepth`. → [Depth-writing fragment shaders in colour-only passes](../reference/shaders.md#depth-writing-fragment-shaders-in-colour-only-passes)
 
 ## Game state
 
