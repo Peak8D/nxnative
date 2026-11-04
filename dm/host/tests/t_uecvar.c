@@ -1,5 +1,5 @@
-// Unreal console variables named in main's fixups (dm_ue_cvar: the rewriter's ue_cvar.py finds them; dm/tools/tests/test_ue_cvar.py tests the search) and the texture pool raise
-// (dm_ue_cvar_tick): the values the host raises, keeps and leaves, and a main without the variable
+// Unreal console variables named in main's fixups (dm_ue_cvar: the rewriter's ue_cvar.py finds them; dm/tools/tests/test_ue_cvar.py tests the search), the texture pool raise and the
+// screen percentages held (dm_ue_cvar_tick): the values the host raises, keeps and leaves, and a main without the variable
 #include "../hle_uecvar.c"
 #include <assert.h>
 #include <sys/mman.h>
@@ -15,7 +15,22 @@ void dm_guest_write_prepare(void *p, size_t n) { (void)p; assert(n == 4); writes
 enum { SIZE = 0x30000 };
 static void cvar(const char *name, uint64_t off) { strcpy(g_mod[0].ue_cvar[g_mod[0].n_ue_cvar].name, name); g_mod[0].ue_cvar[g_mod[0].n_ue_cvar++].off = off; }
 
+static void check_pct(void) {   // ue_screen_percentage: both percentages held, written again when the game sets one back
+    uint8_t *base = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); assert(base != MAP_FAILED);
+    g_nmod = 1; strcpy(g_mod[0].name, "main"); g_mod[0].base = base; g_mod[0].size = SIZE;
+    uint64_t sp = 0x20300, ssp = 0x20400; float a[2] = {50, 50}, b[2] = {80, 80};
+    cvar("r.ScreenPercentage", sp); cvar("r.SecondaryScreenPercentage.GameViewport", ssp);
+    *(uintptr_t *)(base + sp + 0x10) = (uintptr_t)a; *(uintptr_t *)(base + ssp + 0x10) = (uintptr_t)b;
+    setenv("DM_UE_TEXTURE_POOL", "0", 1); setenv("DM_UE_SCREEN_PERCENTAGE", "100", 1);
+    dm_ue_cvar_tick(); assert(a[0] == 100 && a[1] == 100 && b[0] == 100 && b[1] == 100 && writes == 4);
+    dm_ue_cvar_tick(); assert(writes == 4);                            // already held
+    b[0] = 80; dm_ue_cvar_tick(); assert(b[0] == 100 && b[1] == 100 && writes == 5);   // the game set it back
+    munmap(base, SIZE);
+}
+
 static void check(int which) {
+    if (which == 3) { check_pct(); return; }
+    setenv("DM_UE_SCREEN_PERCENTAGE", "0", 1);
     uint8_t *base = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); assert(base != MAP_FAILED);
     g_nmod = 1; strcpy(g_mod[0].name, "main"); g_mod[0].base = base; g_mod[0].size = SIZE;
     uint64_t obj = 0x205c8;
@@ -37,10 +52,10 @@ static void check(int which) {
 
 int main(void) {
     // Each process starts the one-time lookup with fresh state
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         pid_t p = fork(); assert(p >= 0);
         if (!p) { check(i); _exit(0); }
         int status; assert(waitpid(p, &status, 0) == p); assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
-    puts("Unreal console variables: named by the rewriter, the texture pool raised, kept and left as set, a missing variable left alone");
+    puts("Unreal console variables: named by the rewriter, the texture pool raised, kept and left as set, a missing variable left alone, the screen percentages held");
 }
