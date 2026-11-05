@@ -44,3 +44,6 @@ shader_note	Donkey Kong Country: Tropical Freeze shaders
 # ---- After the rewrite ----
 # the rewritten modules are larger than the default 64 MB of used memory
 mem_used	0x7c00000
+
+# a draw that samples the depth attachment of its own pass reads a copy (nvn_mtl.m g_fb_depth; pull request "Same-pass sampling of a depth attachment reads a copy")
+fb_depth_copy	on

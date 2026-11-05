@@ -92,7 +92,7 @@ def main():
             with open(os.path.join(lib, k + '.demand_failed'), 'w') as f: f.write(f'{st.get(k, ("missing", ""))[0]}: {st.get(k, ("", err[-300:]))[1]}\n')
         done.update(batch)
         rc = next((p.returncode for p in procs if p.returncode), 0)
-        print(f'{time.strftime("%H:%M:%S")} built {len(batch) - len(bad)} of {len(batch)} in {time.time() - t0:.1f} s ({len(parts)} processes: {"/".join(str(len(p)) for p in parts)})' + (f'; failed: ' + ', '.join(f'{k} ({st.get(k, ("missing",))[0]})' for k in bad[:6]) if bad else '')
+        print(f'{time.strftime("%H:%M:%S")} built {len(batch) - len(bad)} of {len(batch)} in {time.time() - t0:.1f} s ({len(parts)} processes: {"/".join(str(len(p)) for p in parts)})' + ('; failed: ' + ', '.join(f'{k} ({st.get(k, ("missing",))[0]})' for k in bad[:6]) if bad else '')
               + ('' if rc == 0 else f'; dmsh_build.py exit {rc}: {err.strip().splitlines()[-1][:200] if err.strip() else ""}'), flush=True)
 
 

@@ -336,10 +336,12 @@ namespace Ryujinx.Graphics.Shader.Translation
         // Scoreboards: a variable-latency instruction (one that sets a write barrier, control bits 110..113; 7 = none) writes its registers when the result
         // arrives, and the compiler lets later instructions that do not wait on that barrier (wait mask, bits 116..122) read the registers' old values (LDG R2,
         // [R2.64] then LDG R4, [R2.64 + 4] reads the address twice). Such an instruction's writes go to locals that start as the registers' values; they are
-        // copied to the registers before the first instruction that waits on the barrier, at DEPBAR, and at the end of the block.
+        // copied to the registers before the first instruction that waits on the barrier, at DEPBAR, and at the end of the block. A guarded one whose guard is false at issue writes nothing, so the copy
+        // keeps what was written meanwhile: Yoshi and the Mysterious Book's local lights take EXP2 R17 under P4 and write R17 themselves under !P4 before the wait, and the stale value's copy (a squared
+        // distance, for the light's falloff) overexposed the scene.
         private static void EmitOpsAmpere(EmitterContext context, Block block)
         {
-            List<(Register Reg, Operand Value)>[] pending = new List<(Register, Operand)>[7];
+            List<(Register Reg, Operand Value, Operand Guard)>[] pending = new List<(Register, Operand, Operand)>[7];
             int shadows = 0;
             Stack<int> freeShadows = new();
 
@@ -347,9 +349,22 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 if (pending[barrier] != null)
                 {
-                    foreach ((Register reg, Operand value) in pending[barrier])
+                    foreach ((Register reg, Operand value, Operand guard) in pending[barrier])
                     {
-                        context.Copy(Register(reg), value);
+                        if (guard != null)
+                        {
+                            Operand skip = Label();
+
+                            context.BranchIfFalse(skip, context.ICompareNotEqual(guard, Const(0)));
+                            context.Copy(Register(reg), value);
+                            context.MarkLabel(skip);
+                            freeShadows.Push(guard.GetRegister().Index);
+                        }
+                        else
+                        {
+                            context.Copy(Register(reg), value);
+                        }
+
                         freeShadows.Push(value.GetRegister().Index);
                     }
 
@@ -398,15 +413,14 @@ namespace Ryujinx.Graphics.Shader.Translation
                 int opStart = context.OperationsCount;
 
                 Operand predSkipLbl = null;
+                Operand guardPred = null;
 
                 if (a.Pred != RegisterConsts.PredicateTrueIndex && a.Opcode != Instructions.AmpereOpcodes.Bra)
                 {
                     Operand label;
 
-                    // A false guard on the block's last instruction may go straight to the next block only when no deferred write is pending: the block's end
-                    // commits them (CommitAll below), and the jump went past it. Ocarina of Time's text (vertex shader b19e1bdd247555ec): @!P0 ALD R85, a[0x84] and
-                    // then @P0 FFMA R85 last before the BSYNC that waits on the load; when P0 was false the load never reached R85, every glyph quad was flat
-                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && Array.TrueForAll(pending, p => p == null || p.Count == 0))
+                    // The next block only when nothing waits for the end of this one's commits
+                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && writeBarrier >= 6 && Array.TrueForAll(pending, list => list == null || list.Count == 0))
                     {
                         label = context.GetLabel(block.Successors[0].Address);
                     }
@@ -419,6 +433,8 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                     RegisterType predType = Instructions.AmpereTable.HasUniformGuard(a.Opcode) ? RegisterType.UniformPredicate : RegisterType.Predicate;
                     Operand pred = Register(a.Pred, predType);
+
+                    guardPred = pred;
 
                     if (a.PredInv)
                     {
@@ -450,7 +466,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                 if (writeBarrier < 6 && !op.Props.HasFlag(InstProps.Bra))
                 {
-                    DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows);
+                    DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows, guardPred, a.PredInv);
                 }
             }
 
@@ -458,7 +474,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         }
 
         // The registers the operations from opStart on wrote that have a deferred write pending: that pending value becomes the register's new value as well
-        private static void RefreshPendingAmpere(EmitterContext context, int opStart, List<(Register Reg, Operand Value)>[] pendingAll)
+        private static void RefreshPendingAmpere(EmitterContext context, int opStart, List<(Register Reg, Operand Value, Operand Guard)>[] pendingAll)
         {
             int end = context.OperationsCount;
             HashSet<Register> written = new();
@@ -480,14 +496,14 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             foreach (Register reg in written)
             {
-                foreach (List<(Register Reg, Operand Value)> list in pendingAll)
+                foreach (List<(Register Reg, Operand Value, Operand Guard)> list in pendingAll)
                 {
                     if (list == null)
                     {
                         continue;
                     }
 
-                    foreach ((Register r, Operand v) in list)
+                    foreach ((Register r, Operand v, Operand g) in list)
                     {
                         if (r.Equals(reg))
                         {
@@ -502,12 +518,14 @@ namespace Ryujinx.Graphics.Shader.Translation
         private static void DeferAmpereWrites(
             EmitterContext context,
             int opStart,
-            List<(Register Reg, Operand Value)>[] pendingAll,
+            List<(Register Reg, Operand Value, Operand Guard)>[] pendingAll,
             int barrier,
             ref int shadows,
-            Stack<int> freeShadows)
+            Stack<int> freeShadows,
+            Operand guardPred,
+            bool guardInv)
         {
-            List<(Register Reg, Operand Value)> pending = pendingAll[barrier] ??= [];
+            List<(Register Reg, Operand Value, Operand Guard)> pending = pendingAll[barrier] ??= [];
 
             int end = context.OperationsCount;
             Dictionary<Register, Operand> locals = new();
@@ -571,30 +589,50 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             foreach ((Register reg, Operand local) in locals)
             {
-                // A register written again before its earlier deferred write landed: the later write wins, so the earlier one leaves the pending lists. The
-                // local starts as that earlier result, not as the register: when the later write does not happen (its guard is false) or covers only some
-                // paths, the register still gets the earlier result, as on the GPU, where the writes land in order. Fast Fusion's tone mapping: TEX R0..R3,
-                // then @!P0 TEX R1 (green, offset for chromatic aberration) with no wait between; starting from R1 gave green 0 whenever the guard was false
+                // A register written again before its earlier deferred write landed. An unguarded later write wins: the earlier one leaves the pending lists, and the
+                // local starts as that earlier result, not as the register: when the later write covers only some paths, the register still gets the earlier result,
+                // as on the GPU, where the writes land in order (Fast Fusion's tone mapping: TEX R0..R3, then @!P0 TEX R1 with no wait between gave green 0). A guarded
+                // later write may not happen, so the earlier one stays pending and lands first; the guarded one's commit is skipped where its guard was false
                 Operand start = null;
+                Operand guard = null;
 
-                foreach (List<(Register Reg, Operand Value)> list in pendingAll)
+                if (guardPred != null)
                 {
-                    if (list == null)
+                    if (freeShadows.Count == 0 && shadows == RegisterConsts.ShadowsCount)
                     {
-                        continue;
+                        throw new InvalidOperationException("Ampere: more deferred register writes pending at once than shadow registers");
                     }
 
-                    foreach ((Register r, Operand v) in list.FindAll(p => p.Reg.Equals(reg)))
+                    // The guard as it is at issue, as a nonzero word (a float's bits, which the conditional select keeps), not 1: a denormal could be flushed
+                    guard = Register(freeShadows.Count != 0 ? freeShadows.Pop() : shadows++, RegisterType.Shadow);
+                    context.InsertOperation(at++, new Operation(Instruction.ConditionalSelect, guard, guardPred, Const(guardInv ? 0 : 0x3f800000), Const(guardInv ? 0x3f800000 : 0)));
+                }
+                else
+                {
+                    foreach (List<(Register Reg, Operand Value, Operand Guard)> list in pendingAll)
                     {
-                        start = v;
-                        freeShadows.Push(v.GetRegister().Index);
-                    }
+                        if (list == null)
+                        {
+                            continue;
+                        }
 
-                    list.RemoveAll(p => p.Reg.Equals(reg));
+                        foreach ((Register r, Operand v, Operand g) in list.FindAll(p => p.Reg.Equals(reg)))
+                        {
+                            start = v;
+                            freeShadows.Push(v.GetRegister().Index);
+
+                            if (g != null)
+                            {
+                                freeShadows.Push(g.GetRegister().Index);
+                            }
+                        }
+
+                        list.RemoveAll(p => p.Reg.Equals(reg));
+                    }
                 }
 
                 context.InsertOperation(at++, new Operation(Instruction.Copy, local, start ?? Register(reg)));
-                pending.Add((reg, local));
+                pending.Add((reg, local, guard));
             }
         }
 

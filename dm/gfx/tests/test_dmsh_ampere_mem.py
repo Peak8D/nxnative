@@ -34,7 +34,56 @@ class Translated(unittest.TestCase):
             return r.stdout
 
 
+class GuardedWrites(Translated):
+    P0 = (0x000fda0003f06070, 0x00c0060005007a0c)   # P0 = R5 >= c3[0x18], R5 an instruction's own
+    MOV_R5 = (0x000fe20000000f00, 0x0100000000057a02)   # R5 = c4[0]
+
+    def test_a_guarded_load_reads_its_address_before_the_false_guards_zero(self):
+        # UR4 = c3[0x10]; LDG.!P0 R5, [R5 + UR4], Unreal Engine 5.4's bounds-checked read of its scene data: zeroing R5 first read at the table's start, every instance with the first one's data
+        ur4, ldg = (0x000fe20000000a00, 0x00c0040000047ab9), (0x000ea200081e890f, 0x0000000405057981)
+        waits = (0x004ea200001ee000, 0x00000c05050c7593)   # waits for the load's barrier, then atomically adds its result at the address it read: both uses of it
+        msl = self.translate(inst(*self.MOV_R5) + inst(*ur4) + inst(*self.P0) + inst(*ldg) + inst(*waits) + inst(*EXIT))
+        self.assertNotIn('_m0[0]);', msl.split('kernel')[1].replace('_m0[0].x', ''))   # no read of the table's first word
+        self.assertRegex(msl, r'_m0\[(int\()?\w+')   # an index from the register
+
+    def test_a_deferred_write_under_a_false_guard_writes_nothing(self):
+        # MUFU.EX2 R17, R32 under P0 (write barrier 3); R17 = R29 * R29 under !P0; R17 = R36 * R17 after waiting on the barrier: Yoshi and the Mysterious Book's local lights' falloff. The wait copied
+        # the old R17 over !P0's value, whatever the guard had been
+        ex2, other, used = (0x000ee20000000800, 0x0000002000170308), (0x000fe20000410000, 0x0000001d1d178220), (0x008fe20000410000, 0x0000001724177220)
+        msl = self.translate(inst(*self.MOV_R5) + inst(*self.P0) + inst(*ex2) + inst(*other) + inst(*used) + inst(SUATOM[0], 0x00000c17030c7593) + inst(*EXIT))
+        self.assertRegex(msl, r'\? 1065353216 : 0;')   # the guard as it was at issue, a word that keeps its bits through a select
+        self.assertRegex(msl, r'bool \w+ = \w+ != 0;\s+float \w+ = \w+;\s+if \(\w+\)')   # the copy only where it held
+
+    def test_uniform_handle_forms_translate(self):
+        for code in ((0x000f4200081e0f04, 0x3000040702067f63), (0x000142000c1e03ff, 0x2000040400167f6c), (0x00014200001e0f12, 0x3800001002101364)):   # TLD4 and TXD through a uniform register, TLD4 through a register
+            self.translate(inst(*code) + inst(*EXIT))
+
+    def test_gradients_through_a_uniform_register_keep_their_handle(self):
+        # UR4 = c3[0x10]; TXD through UR4 (write barrier 5); after waiting on it, the result atomically added to an image, so it stays. The translator takes its source 0 as the handle: without it, it could not find one and deleted the read
+        ur4, txd, used = (0x000fe20000000a00, 0x00c0040000047ab9), (0x000142000c1e03ff, 0x2000040400167f6c), (0x020ea200001ee000, 0x00000c16030c7593)
+        msl = self.translate(inst(*ur4) + inst(*txd) + inst(*used) + inst(*EXIT))
+        self.assertIn('gradient', msl)
+
+
 class Suatom(Translated):
+    def test_handle_in_the_games_uniform_buffer(self):   # Unreal Engine 5.4 on the Switch 2 keeps every image in c[3]: the same word 12, in bank 3
+        msl = self.translate(inst(SUATOM[0], SUATOM[1] | 3 << 54) + inst(*EXIT))
+        self.assertIn('cp_i_cb3_C_r32ui', msl)
+        self.assertIn('atomic_fetch_add', msl)
+
+    def test_sured_takes_its_operation(self):   # SURED.OR.U32 as Yoshi and the Mysterious Book's compute shaders encode it, in bank 3
+        self.assertIn('atomic_fetch_or', self.translate(inst(0x000fe2000310e000, 0xa0c002010800759f) + inst(*EXIT)))
+
+    def test_sured_u64_is_still_refused(self):   # the MAX.U64 of its Nanite shaders, on an image of unknown type: refused, never taken as a 32-bit one. On a 2D image it goes
+        # out as two 32-bit halves on R32G32Uint that dmsh_atomic.py merges into Metal's 64-bit atomic (test_atomic64.py); this job names no image, so the atomic check refuses it
+        code = inst(0x000fe2000110e400, 0xa0c002010800759f) + inst(*EXIT)
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'k.bin').write_bytes(code)
+            (Path(d) / 'jobs.json').write_text(json.dumps([dict(key='k', stage='cs', arch='sm86', code=str(Path(d) / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], nvn2_cs=[0, 0, 3, 0x40, 0])]))
+            r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(Path(d) / 'jobs.json'), d], capture_output=True, text=True)
+        self.assertRegex(r.stdout + r.stderr, r'SURED form|Metal image atomics support')
+        self.assertIn('1 failed', r.stdout + r.stderr)
+
     def test_add_u32_on_a_1d_image(self):
         msl = self.translate(inst(*SUATOM) + inst(*EXIT))
         self.assertIn('atomic_fetch_add', msl)   # native (the build's options) or through spirv-cross's buffer alias (these defaults)
@@ -161,8 +210,8 @@ class Shared(Translated):
     IMAD_HI = 0x000fc80007820008, 0x0000000b07087227        # IMAD.HI R8, R7, R11, {R9:R8} (08faccfa2eaa7e01 +0xa80)
     ATOMS_CAS = 0x000e640001800001, 0x00000400ff01738d      # ATOMS.CAS R1, [RZ + 4], R0, R1 (f4aa178bc67c9793 +0x200)
 
-    def msl(self, *code):
-        msl = self.translate(b''.join(code) + inst(*EXIT), shared=0x400)
+    def msl(self, *code, shared=0x400):
+        msl = self.translate(b''.join(code) + inst(*EXIT), shared=shared)
         return msl[msl.index('kernel void'):]
 
     def test_a_32_bit_access_scales_its_register_by_4(self):   # Element 3, not byte 3 (which is element 0)
@@ -208,6 +257,30 @@ class Shared(Translated):
 
     def test_stride_3_scales_its_register_by_16(self):   # Element 3 of 16 bytes, word 12
         self.assertIn('[12] = 77u', self.msl(mov(2, 3), mov(3, 77), inst(*self.STS_SCALED_16)))
+
+    # The same field on other sizes, with an offset: the stride decides the scale, whatever the access size
+    STS64_SCALED_4 = 0x0009ee0000004a00, 0x000900182c007388     # STS.U64 [R44 * 4 + 0x900], R24:R25 (Donkey Kong Bananza's upscaler 7629d857a0a93833)
+    STS_SCALED_16_AT_8 = 0x000fe8000000c800, 0x0000080609008388   # STS.U32 [R9 * 16 + 8], R6 (agl_common: Mario Kart World f94552a2a2bff505, Donkey Kong Bananza c5c746915e9a3265)
+    STS64_SCALED_16 = 0x000fe8000000ca00, 0x0000000209008388    # STS.U64 [R9 * 16], R2:R3 (the same shaders)
+    STS128_SCALED_16 = 0x0001e2000000cc00, 0x000000ff26007388   # STS.128 [R38 * 16], RZ (Pokemon Pokopia 8987796cd5718078)
+
+    def test_a_64_bit_access_with_stride_1_scales_its_register_by_4(self):   # Byte 3 * 4 + 0x900, word 579
+        msl = self.msl(mov(44, 3), mov(24, 77), mov(25, 88), inst(*self.STS64_SCALED_4), shared=0x1000)
+        self.assertIn('[579] = 77u', msl)
+        self.assertIn('[580] = 88u', msl)
+
+    def test_stride_3_adds_its_offset_after_the_scale(self):   # Byte 3 * 16 + 8, word 14
+        self.assertIn('[14] = 77u', self.msl(mov(9, 3), mov(6, 77), inst(*self.STS_SCALED_16_AT_8)))
+
+    def test_a_64_bit_access_with_stride_3_scales_its_register_by_16(self):   # Element 3 of 16 bytes, word 12
+        msl = self.msl(mov(9, 3), mov(2, 77), mov(3, 88), inst(*self.STS64_SCALED_16))
+        self.assertIn('[12] = 77u', msl)
+        self.assertIn('[13] = 88u', msl)
+
+    def test_a_128_bit_access_with_stride_3_scales_its_register_by_16(self):   # Element 3 of 16 bytes, words 12 to 15
+        msl = self.msl(mov(38, 3), inst(*self.STS128_SCALED_16))
+        self.assertIn('[12] = 0u', msl)
+        self.assertIn('[15] = 0u', msl)
 
     # LDSM keeps its mode at 78..79, where LDS has its stride: 1 is a transposed read (MT88), not a scale. Donkey Kong Bananza's upscaler 7629d857a0a93833 +0x1ce0, on R3: scaled, its picture was garbage
     LDSM_MT88 = 0x000fe20000004200, 0x000000000314783b   # LDSM.16.MT88.4 R20, [R3], with no write barrier for the store to wait on

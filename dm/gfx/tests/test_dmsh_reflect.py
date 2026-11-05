@@ -14,7 +14,7 @@ import dmsh_geometry
 def builder_reflection():
     # Isolate pure reflection code from the builder's CLI/profile initialization.
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    names = {'reflect', 'decode_tex', 'decode_ubo_tex', 'decode_ubo_img', 'const_sampler', 'c2_array'}
+    names = {'reflect', 'decode_tex', 'decode_ubo_tex', 'decode_ubo_img', 'const_sampler', 'c2_array', 'has_word', 'in_word'}
     selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'SSBO' for t in n.targets))
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == 'TEX_BASE' for e in t.elts) for t in n.targets))]
@@ -61,8 +61,8 @@ class ImagesInUniformBuffers(unittest.TestCase):
         # handle type 1 in c3: texture word 0x16, sampler word 8 as the translator traced them (Yoshi's FDeferredLightPS: a G-buffer texture, words swapped); the host ORs the pair
         src = 'struct spvDescriptorSetBuffer0\n{\n    texture2d<float> fp_t_cb262147_10020016 [[id(9)]];\n    sampler fp_t_cb262147_10020016Smplr [[id(10)]];\n};\n'
         t, s = REFLECT('synthetic', 'ps', src, {'sbufs': []})[:2]
-        self.assertEqual((t['kind'], t['reg'], t['off'], t.get('reg2'), t.get('off2')), ('tex_ubo', 0, 88, 0, 32))
-        self.assertEqual((s['kind'], s['reg'], s['off'], s.get('reg2'), s.get('off2')), ('samp_ubo', 0, 32, 0, 88))
+        self.assertEqual((t['kind'], t['reg'], t['off'], t.get('sreg'), t.get('soff')), ('tex_ubo', 0, 88, 0, 32))
+        self.assertEqual((s['kind'], s['reg'], s['off'], s.get('sreg'), s.get('soff')), ('samp_ubo', 0, 32, 0, 88))
         combined = self.reflect_one('texture2d<float> fp_t_cb3_2')   # type 0: one word, no pair
         self.assertIsNone(combined.get('off2'))
 

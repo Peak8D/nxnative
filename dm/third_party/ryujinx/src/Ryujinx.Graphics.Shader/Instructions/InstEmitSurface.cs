@@ -183,6 +183,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitSust(context, op.CacheOp, op.Dim, 0, op.TidB, op.Rgba, op.SrcA, op.Dest, 0, useComponents: true, false, isBindless: false);
         }
 
+        // An atomic on an image whose handle the game keeps in its own uniform buffer (Unreal Engine 5.4 on the Switch 2: every image is in c[3]): no descriptor to ask at build time, so the instruction's
+        // size says, as Metal's atomics take only R32Uint and R32Sint
+        private static TextureFormat UniformHandleAtomicFormat(SuatomSize size)
+        {
+            return size is SuatomSize.S32 or SuatomSize.Sd32 ? TextureFormat.R32Sint : TextureFormat.R32Uint;
+        }
+
         private static void EmitSuatom(
             EmitterContext context,
             SuDim dimensions,
@@ -277,7 +284,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             // TODO: FP and 64-bit formats.
             TextureFormat format = size is SuatomSize.Sd32 or SuatomSize.Sd64
-                ? (isBindless ? TextureFormat.Unknown : ShaderProperties.GetTextureFormatAtomic(context.TranslatorContext.GpuAccessor, imm, cbufSlot, strict: metalAtomics))
+                ? (isBindless ? TextureFormat.Unknown : (cbufSlot != TextureOperation.DefaultCbufSlot ? UniformHandleAtomicFormat(size) : ShaderProperties.GetTextureFormatAtomic(context.TranslatorContext.GpuAccessor, imm, strict: metalAtomics)))
                 : GetTextureFormat(size);
 
             if (compareAndSwap)
@@ -581,7 +588,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             // TODO: FP and 64-bit formats. formatOverride: the image's own format where the size does not give it (a 64-bit reduction's halves on R32G32Uint, ASured)
             TextureFormat format = formatOverride != TextureFormat.Unknown ? formatOverride : size is SuatomSize.Sd32 or SuatomSize.Sd64
-                ? (isBindless ? TextureFormat.Unknown : ShaderProperties.GetTextureFormatAtomic(context.TranslatorContext.GpuAccessor, imm, cbufSlot, strict: metalAtomics))
+                ? (isBindless ? TextureFormat.Unknown : (cbufSlot != TextureOperation.DefaultCbufSlot ? UniformHandleAtomicFormat(size) : ShaderProperties.GetTextureFormatAtomic(context.TranslatorContext.GpuAccessor, imm, strict: metalAtomics)))
                 : GetTextureFormat(size);
 
             sourcesList.Add(Rb());

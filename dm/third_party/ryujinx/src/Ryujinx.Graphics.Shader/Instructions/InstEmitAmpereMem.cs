@@ -42,7 +42,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             x(0xb60, InstName.Tex, ATex, InstProps.Tex);
             x(0x361, InstName.Tex, ATex, InstProps.Tex);
+            x(0x364, InstName.Tld4, ATex, InstProps.Tex);
+            x(0x367, InstName.Tld, ATex, InstProps.Tex);
             x(0xf60, InstName.Tex, ATex, InstProps.Tex);
+            x(0xf63, InstName.Tld4, ATex, InstProps.Tex);
+            x(0xf6c, InstName.Txd, ATex, InstProps.Tex);
             x(0xb66, InstName.Tld, ATex, InstProps.Tex);
             x(0xf66, InstName.Tld, ATex, InstProps.Tex);   // TLD through a handle in a uniform register, as 0xf60 for TEX (Fast Fusion's terrain vertex shaders)
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
@@ -293,13 +297,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 }
             }
 
-            // The address is read once, before any result is written, the predicated form's zeroes included (the destination may be the address register:
-            // LDG.128 R0, [R0.64]; Yoshi's instance culling kernel loads @!P1 LDG R29, [R29 + UR4], and zeroed first, every such load read element 0)
+            // The address is read once, before any result is written, the zeros of a false predicate too: the destination may be the address register (LDG.128 R0, [R0.64]; Unreal Engine 5.4's bounds-checked
+            // reads of its scene data, LDG.P R5, [R5 + UR4], which read at the table's start when R5 was zeroed first: every instance at the first one's transform, and a black scene)
             (Operand[] los, Operand[] his) = (new Operand[count], new Operand[count]);
 
             for (int index = 0; index < count; index++)
             {
-                (los[index], his[index]) = AGlobalAddress(context, x, 90, 32, index * 4);
+                (Operand lo, Operand hi) = AGlobalAddress(context, x, 90, 32, index * 4);
+                (los[index], his[index]) = (context.Copy(lo), context.Copy(hi));
             }
 
             Operand lblSkip = null;
@@ -673,13 +678,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int opcode = x.Opcode;
 
             // TEX through a handle in a register, not named by its offset: the compiler's form for a handle it read itself, usually from a table at a computed offset. BindlessElimination takes the
-            // handle from there, as for Maxwell's TEX.B. The other fields are 0xb60's. 0xf60: a uniform register at 40..46. 0x361 (bit 59 set): a register, the first of the second source block,
+            // handle from there, as for Maxwell's TEX.B. The other fields are 0xb60's. 0xf60, 0xf63 and 0xf6c (TEX, TLD4 and TXD, whose other fields are 0xb60's, 0xb63's and 0xb6c's): a uniform register at
+            // 40..46. 0x361, 0x364 and 0x367 (TEX, TLD4 and TLD, bit 59 set): a register, the first of the second source block,
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
-            bool handleInB = opcode == 0x361 || opcode == 0x364;   // 0x364: TLD4's, laid out as 0x361 is to TEX
-            bool bindless = handleInB || opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c;
+            bool handleInB = opcode is 0x361 or 0x364 or 0x367;   // 0x364 / 0x367: TLD4's and TLD's, laid out as 0x361 is to TEX
+            bool bindless = handleInB || opcode is 0xf60 or 0xf63 or 0xf66 or 0xf6c;
 
-            if (opcode == 0xf60 || opcode == 0xf63 || opcode == 0xf66 || opcode == 0xf6c)
+            if (opcode is 0xf60 or 0xf63 or 0xf66 or 0xf6c)
             {
                 int ur = x.Bits(40, 46);
 
@@ -688,7 +694,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = opcode switch { 0xf63 or 0x364 => 0xb63, 0xf66 => 0xb66, 0xf6c => 0xb6c, _ => 0xb60 };
+                opcode = opcode is 0xf63 or 0xf66 or 0xf6c ? opcode - 0x400 : opcode is 0x364 or 0x367 ? opcode + 0x7ff : 0xb60;
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));
@@ -766,6 +772,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
             {
                 int n0 = coords + (isArray || offset ? 1 : 0);
                 (List<Operand> a, List<Operand> b) = ATexBlocks(context, x, n0, 2 * coords);
+
+                if (bindless)
+                {
+                    sources.Add(boundHandle);
+                }
 
                 sources.AddRange(a.GetRange(0, coords));
 
