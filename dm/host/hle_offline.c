@@ -13,6 +13,14 @@ HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects t
 HLE_FORCE("_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc", "telemetry session ID: no service connection, nothing added, reports success", Result, h_prepo_AddSess, void *rep, const char *key) { (void)rep; (void)key; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", "telemetry internet connection status: no service connection, nothing added, reports success", Result, h_prepo_AddNet, void *rep, const char *a, const char *b, const char *c) { (void)rep; (void)a; (void)b; (void)c; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo28RequestImmediateTransmissionEv", "telemetry immediate upload; nothing is sent, reports success", Result, h_prepo_Tx, void) { return RES_OK; }
+// PlayReport::Send(const account::Uid&) (SDK 22; The Legend of Zelda: Ocarina of Time, main+0x379164c, as its game starts) returns an AsyncContext {IAsyncContext *, Result}
+// through x8, which the SDK fills from the prepo:u service the host does not serve (abort 0xe15 in ShimLibraryGlobal::GetSession). Here a finished context with no object and
+// success, what AsyncContext(Result) makes: its completion event is then created signalled and GetResult reads the success (sdk 0x5a9230, 0x5a9320). Nothing is sent
+extern const char h_prepo_Send_sret[];
+__asm__(".text\n.p2align 2\n.globl _h_prepo_Send_sret\n.private_extern _h_prepo_Send_sret\n_h_prepo_Send_sret:\n"
+        "    stp xzr, xzr, [x8]\n    mov w0, wzr\n    ret\n");
+__attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_h_prepo_Send = {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", (void *)(uintptr_t)h_prepo_Send_sret,
+    "telemetry report send (SDK 22): a finished async context with success, through x8; nothing is sent"};
 
 // ---------- ldn: local wireless. Initialization fails, state is always "none" ----------
 HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { return RES_FAIL; }
