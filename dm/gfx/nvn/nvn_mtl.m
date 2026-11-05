@@ -4382,7 +4382,7 @@ static void shmap_read(void) {
 #include "nvn_pso_skey.h"
 #include "nvn_geometry.h"
 #include "nvn_feedback.h"
-@interface NvProg : NSObject { @public NvShader *sh[6]; char gs_miss[17]; NvProg *geo_raster, *geo_lean_raster; int8_t c_sw, c_iw, c_img; } @end   // c_sw / c_iw / c_img: prog_swrites, udc_note_draw's image write, image_prepare's written image slots; + 1 once known (the shaders are fixed once made)   // geo_raster: GS output reader paired with this program's fragment stage; geo_lean_raster: its own vertex and fragment stages (a lean passthrough kernel)
+@interface NvProg : NSObject { @public NvShader *sh[6]; char gs_miss[17]; NvProg *geo_raster, *geo_lean_raster; int8_t c_sw, c_iw, c_img, fs_wait; } @end   // fs_wait: its pixel stage is not loaded (built on demand, or failed)   // c_sw / c_iw / c_img: prog_swrites, udc_note_draw's image write, image_prepare's written image slots; + 1 once known (the shaders are fixed once made)   // geo_raster: GS output reader paired with this program's fragment stage; geo_lean_raster: its own vertex and fragment stages (a lean passthrough kernel)
 @implementation NvProg @end
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
 @interface WarmItem : NSObject { @public int kind, record; NSString *key, *vs_key, *fs_key; NvShader *shader, *vs, *fs; pso_key pso; id<MTLFunction> fsfn; id object; } @end   // record: a prefetched library, written to the prewarm lists when claimed (shader_get's lines)
@@ -4821,7 +4821,9 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
             // DM_NVN_SHDUMP=directory: shaders missing from the map are saved as <key>.ctl (the control section's key bytes) and <key>.code (code area, nvn_ctl_lens), to trace their source / add them to the map offline
             static const char *shd; static int shd_init; if (!shd_init) { shd = getenv("DM_NVN_SHDUMP"); shd_init = 1; if (shd && *shd) mkdir(shd, 0777); }   // create the dump folder: a missing one made every fopen fail silently
             if (shd) { char path[1024]; FILE *f; uint32_t ncode, nctl; nvn_ctl_lens(p->sd[i].control, &nctl, &ncode);   // with SHDUMP set the control section is the host's copy
-                snprintf(path, sizeof path, "%s/%s.ctl", shd, k.UTF8String); if ((f = fopen(path, "wb"))) { fwrite(p->sd[i].control, 1, nctl, f); fclose(f); }
+                uint32_t nfile = nctl;   // an NVN2 section whole (its length at +0x30, within the host's 0x880-byte copy): the split reads the stage at +0x56, past the key bytes
+                if (nctl == 0x48) { uint32_t own; memcpy(&own, (const uint8_t *)p->sd[i].control + 0x30, 4); nfile = own > nctl && own <= 0x880 ? own : 0x880; }
+                snprintf(path, sizeof path, "%s/%s.ctl", shd, k.UTF8String); if ((f = fopen(path, "wb"))) { fwrite(p->sd[i].control, 1, nfile, f); fclose(f); }
                 snprintf(path, sizeof path, "%s/%s.code", shd, k.UTF8String);
                 if (p->sd[i].data && ncode && ncode < (1u << 24) && (f = fopen(path, "wb"))) { fwrite((const void *)(uintptr_t)p->sd[i].data, 1, ncode, f); fclose(f); } }
             continue;
@@ -4831,6 +4833,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         if (sh) o->sh[st] = sh;
         else if (st >= 0 && demand_on()) { demand_ask(k, stage); incomplete = 1; }
         else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
+        if (!sh && st == 1) o->fs_wait = 1;   // a task / mesh draw waits for it (mesh_tasks_draw): Metal takes no mesh pipeline without a fragment function
         if (!sh && st == 2) strlcpy(o->gs_miss, k.UTF8String, sizeof o->gs_miss);
     }
     prog_fold_gs(o);   // a slice-writing geometry shader: the vertex shader's layer entry points instead
@@ -10396,7 +10399,7 @@ typedef struct { uint64_t ind, ibuf; int32_t prim, itype; uint64_t args, ixb; ui
 static ixc_ent g_ixc[IXC_MAX]; static int g_ixc_n; static uint64_t g_ixc_epoch, g_ixc_sub, g_ixc_runs, g_ixc_splits;
 // The kernels: dm/gfx/msl/ixc.metal
 static int ixc_wanted(const p_draw *dw, const p_draw_idx *di) {
-    if (dw) return dw->ind && (dw->prim == 6 || dw->prim == 7);
+    if (dw) return dw->ind && (dw->prim == 6 || dw->prim == 7 || dw->prim == DM_PRIM_MESH_TASKS);   // and DrawMeshTasksIndirect, whose record is not Metal's (mesh_tasks_draw)
     return di->ind && (di->prim == 6 || di->prim == 7 || di->itype == 0);
 }
 static const ixc_ent *ixc_find(const p_draw *dw, const p_draw_idx *di) {
@@ -10437,7 +10440,8 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
     id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at];
     for (int i = 0; i < n; i++) {
         ixc_ent *e = &g_ixc[n0 + i]; uint64_t rec, ib = 0; void *mb; uint64_t mo; e->args = 0;
-        if (!mtl_gpu_addr(e->ind, e->itype < 0 ? 16 : 20, &mb, &mo, &rec)) continue;
+        if (!mtl_gpu_addr(e->ind, e->prim == DM_PRIM_MESH_TASKS ? 8 : e->itype < 0 ? 16 : 20, &mb, &mo, &rec)) continue;
+        if (e->prim == DM_PRIM_MESH_TASKS) { e->ixb = 0; e->ixlen = 0; aj[na++] = (ajob){rec, ag + 32 * (uint64_t)i, (uint32_t)e->prim, 0}; e->args = ag + 32 * (uint64_t)i; continue; }   // {count, 1, 1}, first at +16
         if (e->itype < 0) {   // DrawArraysIndirect quads / fans: the shared index buffers, one thread per record
             if (e->prim == 7) quad_ib_make(); else fan_ib_make();
             e->ixb = e->prim == 7 ? g_quad_gpu : g_fan_gpu; e->ixlen = (uint32_t)(e->prim == 7 ? g_quad_ib.length : g_fan_ib.length);

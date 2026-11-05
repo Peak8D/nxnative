@@ -112,7 +112,8 @@ static void vertex_dump(NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
         (dw ? dw->ind || dw->mdi_cnt : di->ind || di->mdi_cnt) || S.rast_discard) return;
     for (int i = 0; i < vs->rf.nb; i++) if (vs->rf.b[i].rw) return;
     int count = dw ? dw->count : di->count, instances = dw ? dw->instances : di->instances;
-    if (count <= 0 || instances > 1 || (di && (di->itype < 0 || di->itype > 2))) return;
+    if (count <= 0 || (di && (di->itype < 0 || di->itype > 2))) return;
+    uint32_t inst = instances > 0 ? (uint32_t)instances : 1u;   // every instance, the capture's records instance by instance ({first, vertices, first instance, instances})
     unsigned number = captured++; lc_land(); rp_flush(); mdi_wait();
     uint32_t lo = dw ? (uint32_t)dw->first : UINT32_MAX, hi = dw ? lo + count - 1 : 0;
     if (di) {
@@ -124,28 +125,28 @@ static void vertex_dump(NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
         if (lo == UINT32_MAX || (int64_t)lo + di->base_vertex < 0 || (int64_t)hi + di->base_vertex > UINT32_MAX) return;
         lo += di->base_vertex; hi += di->base_vertex;
     }
-    uint64_t span = (uint64_t)hi - lo + 1, bytes = span * 144 * 4;
+    uint64_t span = (uint64_t)hi - lo + 1, bytes = span * inst * 144 * 4;
     if (!span || bytes > (64u << 20)) return;
     id<MTLRenderPipelineState> ps = geo_capture_pso(vs); if (!ps) return;
     id<MTLBuffer> output; size_t offset = arena_alloc(bytes + 512, &output);
     uint64_t gpu = output.gpuAddress + offset;
     uint64_t info[4] = {gpu + 512, 0, (uint64_t)lo | span << 32, (uint32_t)(dw ? dw->base_instance : di->base_instance) | 1ull << 32};
-    nvn_geo_capture gc = {info[0], 0, {(uint32_t)lo, (uint32_t)span, (uint32_t)info[3], 1}, GEO_CAPTURE_WORDS, {0}};
+    nvn_geo_capture gc = {info[0], 0, {(uint32_t)lo, (uint32_t)span, (uint32_t)info[3], inst}, GEO_CAPTURE_WORDS, {0}};
     for (int k = 0; k < GEO_CAPTURE_WORDS; k++) gc.slot[k] = (int16_t)k;   // every word, in order
     memcpy((uint8_t *)output.contents + offset, &gc, sizeof gc);
-    p_draw range = {.first = (int32_t)lo, .count = (int32_t)span, .instances = 1, .base_instance = (int32_t)(info[3] & UINT32_MAX)};
+    p_draw range = {.first = (int32_t)lo, .count = (int32_t)span, .instances = (int32_t)inst, .base_instance = (int32_t)(info[3] & UINT32_MAX)};
     vbuf_prepare(&vs->rf, &range, NULL);   // the vertices the capture reads: streams it reads past get zeros there (vbuf_need)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *rd = [MTL4RenderPassDescriptor new]; rd.renderTargetWidth = rd.renderTargetHeight = rd.defaultRasterSampleCount = 1;
     id<MTL4RenderCommandEncoder> en = enc_r_begin(rd); enc_r_pso(en, ps); bind_vbufs(en);
     vconv_bind(en, vs, 1, &range, NULL); args_dirty_all(); encode_args(en, vs, 0, 1); enc_r_vbuf(en, 13, gpu);
-    enc_r_draw_instanced(en, MTLPrimitiveTypePoint, lo, span, 1, (uint32_t)info[3]); enc_r_end(en);
+    enc_r_draw_instanced(en, MTLPrimitiveTypePoint, lo, span, inst, (uint32_t)info[3]); enc_r_end(en);
     mdi_wait();
     char filename[1200]; if (all) snprintf(filename,sizeof filename,"%s_%04u_%s.bin",path,number,vs->key); else strlcpy(filename,path,sizeof filename);
-    FILE *f = fopen(filename, "wb"); if (f) { uint32_t header[4] = {lo, (uint32_t)span, all ? 4u : 144u, (uint32_t)info[3]}; fwrite(header, sizeof header, 1, f);
-        if (all) for (uint64_t i=0;i<span;i++) fwrite((uint8_t *)output.contents + offset + 512 + i*144*4,1,16,f);
+    FILE *f = fopen(filename, "wb"); if (f) { uint32_t header[4] = {lo, (uint32_t)(span * inst), all ? 4u : 144u, (uint32_t)info[3]}; fwrite(header, sizeof header, 1, f);
+        if (all) for (uint64_t i=0;i<span*inst;i++) fwrite((uint8_t *)output.contents + offset + 512 + i*144*4,1,16,f);
         else fwrite((uint8_t *)output.contents + offset + 512, 1, bytes, f); fclose(f); }
-    MLOG("vertex dump %s: first %u, count %llu, %s", vs->key, lo, (unsigned long long)span, filename);
+    MLOG("vertex dump %s: first %u, count %llu, instances %u, %s", vs->key, lo, (unsigned long long)span, inst, filename);
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
 }
 static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint32_t primitive_base);
@@ -546,11 +547,17 @@ static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
 // pixel stage alone, a program of its own as a geometry draw's raster stage is, so it takes the render pass and the pixel stage's state like any draw; mtk_pso gives its pipeline and
 // mtk_encode binds the two stages and draws. The mesh stage shares the vertex stage's table, as geo_mesh_encode's does, and a task shader has the object stage's; both read the
 // draw's first workgroup at buffer 29. A pipeline is built in the background and its draws are left out until it is ready, as for a geometry mesh pipeline
-static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; } g_mtk;
+static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t args; } g_mtk;   // args: DrawMeshTasksIndirect's converted record (ixc_run), 0 for DrawMeshTasks
 static void draw_(const p_draw *dw, const p_draw_idx *di);
 static uint64_t g_mtk_n, g_mtk_wait;
 static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
 static NSObject *g_pso_mtk_building;
+static id<MTLFunction> mtk_nofrag(void) {   // the fragment function of a task / mesh program with no pixel stage (depth only): a mesh pipeline must have one
+    static id<MTLFunction> fn; static dispatch_once_t once;
+    dispatch_once(&once, ^{ NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nfragment void dm_mesh_nofrag() {}\n" options:nil error:&e];
+        fn = [lib newFunctionWithName:@"dm_mesh_nofrag"]; if (!fn) MLOG("[RED] task / mesh: the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
+    return fn;
+}
 static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
     pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
@@ -562,7 +569,8 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
     MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-    m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nofrag(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    if (!m.fragmentFunction) { os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &k, NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock); return nil; }
     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
@@ -580,28 +588,54 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
     id<MTLBuffer> b; size_t o = arena_alloc(16, &b); memcpy((uint8_t *)b.contents + o, &g_mtk.first, 4);
+    uint64_t first = g_mtk.args ? g_mtk.args + 16 : b.gpuAddress + o;   // an indirect draw's first workgroup is in its converted record
     if (ts) { [en setArgumentTable:g_ot atStages:MTLRenderStageObject]; g_args_dirty[3] = 1; encode_args(en, ts, 3, 0);
-              if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, b.gpuAddress + o, DMSH_MESH_FIRST_SLOT); else [g_ot setAddress:b.gpuAddress + o atIndex:DMSH_MESH_FIRST_SLOT]; }
+              if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, first, DMSH_MESH_FIRST_SLOT); else [g_ot setAddress:first atIndex:DMSH_MESH_FIRST_SLOT]; }
     g_args_dirty[4] = 1; encode_args(en, ms, 4, 1);
-    enc_r_vbuf(en, DMSH_MESH_FIRST_SLOT, b.gpuAddress + o);
-    [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(ms->mesh_threads, 1, 1)];
+    enc_r_vbuf(en, DMSH_MESH_FIRST_SLOT, first);
+    if (g_mtk.args) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.args threadsPerObjectThreadgroup:MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(ms->mesh_threads, 1, 1)];
+    else [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(ms->mesh_threads, 1, 1)];
 }
 static void mesh_tasks_draw(const p_draw *dw) {
-    if (!S.prog || dw->count <= 0) return;
+    // DM_NVN_MESH_SKIP=indirect / direct / all (diagnostic): those task / mesh draws are skipped, to tell which of them a GPU hang comes from
+    static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_MESH_SKIP"); skip = !e ? 0 : !strcmp(e, "indirect") ? 1 : !strcmp(e, "direct") ? 2 : !strcmp(e, "all") ? 3 : 0;
+        if (skip) MLOG("DM_NVN_MESH_SKIP=%s: those task / mesh draws are skipped", e); }
+    if ((skip & 1 && dw->ind) || (skip & 2 && !dw->ind)) return;
+    if (!S.prog || (dw->count <= 0 && !dw->ind)) return;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
     if (ts && ts->mesh_kind != 1) ts = nil;
     if (!ms || ms->mesh_kind != 2 || !ms->fn || (ts ? !ts->fn : !ms->mesh_notask)) {
         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
+    if (!pr->sh[1] && pr->fs_wait) { g_mtk_wait++; return; }   // its pixel shader is not loaded yet (built on demand): drawn once the program is built again with it
+    // DM_NVN_MESH_IND_CPU=1 (diagnostic): DrawMeshTasksIndirect's {count, first} read on the CPU at encode time and drawn as DrawMeshTasks (0: skipped), with no conversion
+    // pass and no render pass split; a record the GPU writes earlier in the same submission is read before it is written
+    static int ind_cpu = -1; if (ind_cpu < 0) { const char *e = getenv("DM_NVN_MESH_IND_CPU"); ind_cpu = e && atoi(e); if (ind_cpu) MLOG("DM_NVN_MESH_IND_CPU=1: indirect task / mesh records read on the CPU"); }
+    p_draw dcpu;
+    if (dw->ind && ind_cpu) {
+        void *mb; uint64_t mo; if (!mtl_addr(dw->ind, 8, &mb, &mo)) return;
+        uint32_t rec[2]; memcpy(rec, (const void *)(uintptr_t)dw->ind, 8); if (!rec[0]) return;
+        static int cap = -1; if (cap < 0) { const char *e = getenv("DM_NVN_MESH_MAX"); cap = e ? atoi(e) : 0; if (cap) MLOG("DM_NVN_MESH_MAX=%d: CPU-read task / mesh counts capped", cap); }
+        dcpu = *dw; dcpu.ind = 0; dcpu.count = (int32_t)MIN(rec[0], cap > 0 ? (uint32_t)cap : 65535u); dcpu.first = (int32_t)rec[1]; dw = &dcpu;
+        { static int n; if (n++ < 8) MLOG("DM_NVN_MESH_IND_CPU: record %u, %u", rec[0], rec[1]); }
+    }
+    uint64_t args = 0;
+    if (dw->ind) {   // DrawMeshTasksIndirect: its {count, first} record converted on the GPU before the render pass (ixc_run, with the later ones up to the next buffer write)
+        if (!ixc_find(dw, NULL)) ixc_run(dw, NULL);
+        const ixc_ent *e = ixc_find(dw, NULL);
+        if (!e || !e->args) { RED_ONCE(151, "DrawMeshTasksIndirect skipped: its record at %#llx is in no memory pool", (unsigned long long)dw->ind); return; }
+        args = e->args;
+        { static int once; if (!once++) MLOG("task / mesh: first indirect draw, record at %#llx converted on the GPU", (unsigned long long)dw->ind); }
+    }
     image_prepare(pr, 1u << 3 | 1u << 4);
     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
-    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
+    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count; g_mtk.args = args;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
     draw_(&triangle, NULL);
-    g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
+    g_geo_program = nil; g_mtk.on = 0; g_mtk.args = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
     swrite_note(pr); g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first);

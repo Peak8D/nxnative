@@ -3,7 +3,9 @@
 using namespace metal;
 struct ajob { device const uint *rec; device uint *args; uint prim, cap; };
 kernel void ixc_arrays(device const ajob *j [[buffer(0)]], uint i [[threadgroup_position_in_grid]]) {
-  device const uint *s = j[i].rec; uint n = s[0], c = j[i].prim == 7 ? n / 4 * 6 : n >= 3 ? (n - 2) * 3 : 0;
+  device const uint *s = j[i].rec;
+  if (j[i].prim == 0x40) { device uint *d = j[i].args; d[0] = min(s[0], 65535u); d[1] = 1; d[2] = 1; d[4] = s[1]; return; }   // at most the hardware's 65535 task workgroups: a larger count is not a draw, and launched it hung the GPU   // DrawMeshTasksIndirect {count, first}: MTLDispatchThreadgroupsIndirectArguments, first at +16 (mtk_encode)
+  uint n = s[0], c = j[i].prim == 7 ? n / 4 * 6 : n >= 3 ? (n - 2) * 3 : 0;
   device uint *d = j[i].args; d[0] = min(c, j[i].cap); d[1] = s[1]; d[2] = 0; d[3] = s[2]; d[4] = s[3]; }
 struct ejob { device const uint *rec; device const uchar *ib; device uint *out; device uint *args; uint prim, isz, ilen, cap; };
 kernel void ixc_expand(constant ejob &j [[buffer(0)]], uint i [[thread_position_in_grid]]) {
