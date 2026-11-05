@@ -158,6 +158,20 @@ def bnsh_shaders(d, base, label):
             why = check(label, st, ctl, code)
             if why: red(f'{label} BNSH @{base:#x} variation {v} {st}: {why}')
             out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
+        # NVN2 programs name their task and mesh shaders in slots 7 and 8 (slot 6 empty): Ocarina of Time's model shaders (Model.Product.110 bfsha, 1,683 programs) draw the scene
+        # through them. Taken only where the slot holds an NVN2 control section of that stage (+0x56: 6, 7): an earlier SDK's program has no such slots
+        for si, st, sb in ((7, 'ts', 6), (8, 'ms', 7)):
+            at = base + prog + 8 + 8 * si
+            sc = struct.unpack_from('<Q', d, at)[0] if at + 8 <= len(d) else 0
+            if not sc or base + sc + 0x20 > len(d): continue
+            pctl, pcode, ncode, nctl = struct.unpack_from('<QQII', d, base + sc + 8)
+            if not 0x48 <= nctl < 0x10000 or base + pctl + nctl > len(d) or base + pcode + ncode > len(d): continue
+            ctl = d[base + pctl:base + pctl + nctl]
+            if not nvn2_ctl(ctl) or len(ctl) <= 0x56 or ctl[0x56] != sb: continue
+            code = d[base + pcode:base + pcode + ncode]
+            why = check(label, st, ctl, code)
+            if why: red(f'{label} BNSH @{base:#x} variation {v} {st}: {why}')
+            out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
     return out
 
 def nvn2_stage(ctl, code):   # an NVN2 shader's stage: compute, task and mesh by the control section's stage byte (+0x56: 5, 6, 7; a task or mesh shader's SPH reads as vertex or domain), else the SPH at the code area's start (no code header)
@@ -224,6 +238,42 @@ def ndsr_shaders(d, label):
         out.append((where, st, ctl, code))
         if st == 'vs': prog = where
         elif st == 'ps' and prog: BAHS_VAR[prog] = BAHS_VAR[where] = f'{label}#NDSR#{prog.rsplit("@", 1)[1]}'; prog = None
+    if struct.unpack_from('<I', d, 4)[0] == 0x10100:   # its compute records lie off the walk's grid (ndsr_scan); Bananza's packs are 0x300, Splatoon Raiders' 0x40100
+        out += ndsr_scan(d, label, {int(w.rsplit('@', 1)[1], 16) for w, _, _, _ in out})
+    return out
+
+def ndsr_scan(d, label, taken):
+    """NDSR records anywhere in a pack's first 16 KB, at any word: {control, control length << 4 | type, code (its low bits a flag), code length / 16 << 8 | type}, kept
+    when the record's code length is the control section's (+0x44). Version 0x10100 (Ocarina of Time's agl packs and its title video pack) puts its compute records first,
+    from +0x24 with words between them, off the 16-byte grid ndsr_shaders walks: agl_ndsr_vr.pck's d17eefaff4f0bc23 at +0x3c. taken: control offsets read already"""
+    out = []
+    for o in range(4, min(len(d) - 16, 0x4000), 4):
+        c, cl, k, kl = struct.unpack_from('<4I', d, o)
+        if c in taken or not (c + 0x48 <= len(d) and nvn2_ctl(d[c:c + 0x48])): continue
+        ctl = d[c:c + max(cl >> 4, 0x48)]; size = struct.unpack_from('<I', ctl, 0x44)[0]; k &= ~0xf
+        if not size or (kl >> 8) * 16 != size or k + size > len(d): continue
+        code = d[k:k + size]; st = nvn2_stage(ctl, code)
+        if st is None or check(label, st, ctl, code): continue
+        out.append((f'{label}#NDSR@{c:#x}', st, ctl, code)); taken.add(c)
+    return out
+
+def ndve_shaders(d, label):
+    """NVN2 video enhancement pack (Movie/Ndve/*.dat.zs, Ocarina of Time: its title video's 11 compute shaders): 'NDVE', an agl NDSR pack at +0x28 (ndsr_shaders, with offsets
+    from its own start), then shaders stored as a control section followed by its code area, the section naming its own length (+0x30) and the code's (+0x44). The NDSR
+    records' sections are not read again inline: 4f41ccf24f163e0d's names length 0 and its code lies before it"""
+    out, rel = [], set()
+    n = d.find(b'NDSR', 0, 0x100)
+    if n >= 0: out += ndsr_scan(d[n:], f'{label}#NDSR@{n:#x}', rel)   # version 0x10100: its records 0x28 bytes apart from +0x24, a code offset with its low bit set
+    taken = {n + c for c in rel}
+    for m in re.finditer(re.escape(CTL_MAGIC + b'\xc9\0\0\0'), d):
+        c = m.start()
+        if c in taken or c + 0x48 > len(d): continue
+        own, size = struct.unpack_from('<I', d, c + 0x30)[0], struct.unpack_from('<I', d, c + 0x44)[0]
+        if not 0x48 <= own < 0x10000 or not size or c + own + size > len(d): continue
+        ctl, code = d[c:c + own], d[c + own:c + own + size]
+        st = nvn2_stage(ctl, code)
+        if st is None or check(label, st, ctl, code): continue
+        out.append((f'{label}#NDVE@{c:#x}', st, ctl, code))
     return out
 
 def shn_shaders(d, label):
@@ -2616,6 +2666,7 @@ def scan_blob(d, label, out, depth=0, left=None):
         return
     if d[:4] == b'BAHS': out.extend(bahs_shaders(d, label)); return
     if d[:4] == b'NDSR': out.extend(ndsr_shaders(d, label)); return
+    if d[:4] == b'NDVE': out.extend(ndve_shaders(d, label)); return
     if d[:4] == b'SHN!': out.extend(shn_shaders(d, label)); return
     if d[:4] == GLSLC_MAGIC and (shaders := viper_shader(d, label)): out.extend(shaders); return
     if d[:4] == b'VIPR': out.extend(vipr_shaders(d, label))
@@ -2916,7 +2967,7 @@ def scan_file_in(args):
         try: pairs = unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
         return rel, uniq_keys(found), var_pairs(found) | {(a, b, 'prog') for a, b in pairs}, trees
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] not in (b'MSHD', b'SHN!') and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] not in (b'MSHD', b'SHN!', b'NDVE') and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside
