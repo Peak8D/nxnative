@@ -143,6 +143,14 @@ def source_commit():   # DMCommit: the checkout that packed the app (scripts/bug
     return head + ('+dirty' if dirty else '') if head else None
 
 
+def strip_build_paths(exe, codesign):   # the debug map out of a binary the app ships: its N_OSO / N_SO entries name the object files and sources under the builder's home folder (412 in
+    # Yoshi's host); the symbols the host's backtraces read stay. strip leaves no valid signature, so it is signed ad hoc again (no identity; sign() signs it again for --sign)
+    with open(exe, 'rb') as f:
+        if f.read(4) not in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe'): return   # not a Mach-O (the tests' stand-ins)
+    run(['strip', '-S', exe])
+    run([codesign, '--force', '--sign', '-', exe])
+
+
 def strip_detritus(app):   # the "._name" files a copy from or onto an exFAT volume leaves in the bundle: codesign reads each one as a code object and refuses the bundle ("code object is not signed at all")
     for parent, _, files in os.walk(app):
         for n in files:
@@ -272,6 +280,7 @@ def pack(a):
     step(f'launcher and host ({"clones" if clone["romfs"] else "copies"} of the game files)')
     build_launcher(mac / EXE, minos, clang, swiftc, sdk)
     shutil.copy(a.host, mac / 'dmhost')   # data and mode, not the build's extended attributes (copy2 would carry them into the app)
+    strip_build_paths(mac / 'dmhost', codesign)   # not the launcher: it has no debug map, and signing the bundle's executable here would seal a bundle still being filled
     copy(mods, dm, clone['mods'])
     if tables: copy(tables, dm, False)
     if pairs: shutil.copyfile(pairs, dm / 'pso_pairs.tsv')   # the split's copy, for a profile without the table
