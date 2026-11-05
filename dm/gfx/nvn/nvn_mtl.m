@@ -1852,7 +1852,7 @@ static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_ser_gen = 1;
 // Which serial each change was about, for the texture ID cache (ser_sync): a site that changes one serial's object bumps g_ser_gen through ser_note; any other bump (the sharing table,
 // upgrades, a dropped upload) has no note, and the next ser_sync then sends every texture ID down the slow path as before. A full list is the same as a missing note
-enum { SER_NOTES = 64 };
+enum { SER_NOTES = 4096 };   // Ocarina of Time's first level changed more than 64 serials between syncs while loading: a new epoch each time
 static os_unfair_lock g_snote_lk = OS_UNFAIR_LOCK_INIT; static uint64_t g_snote[SER_NOTES]; static unsigned g_nsnote;
 static void ser_note(uint64_t serial) {
     os_unfair_lock_lock(&g_snote_lk); if (g_nsnote < SER_NOTES) g_snote[g_nsnote++] = serial; g_ser_gen++; os_unfair_lock_unlock(&g_snote_lk);
@@ -1957,6 +1957,7 @@ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get
 // so a record replayed again soon still finds its texture
 enum { NGHOST = 512 };
 static nvn_hmap g_tex_live = {.klen = 8};   // serial → (void *)1, under g_smu
+static nvn_hmap g_tex_pooled = {.klen = 8};   // serial → (void *)1 while a texture pool descriptor holds it (tex_pooled), under g_smu
 static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
 void mtl_tex_init(const tex_t *t) {
     if (!t->serial) return;
@@ -1970,18 +1971,41 @@ static void obj_drop(id o) { if (alias_has(o)) defer_obj_unref(o); else defer_ob
 static __unsafe_unretained id tex_get(uint64_t k) {
     pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); if (!o && g_ghost.n) o = hm_get_id(&g_ghost, &k); pthread_mutex_unlock(&g_smu); return o;
 }
+static void ghost_slot(uint64_t k) {   // k takes the ghost ring's next slot; the serial there goes, and resolves anew too. Caller holds g_smu
+    uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
+    if (*slot) { id ev = hm_get_id(&g_ghost, slot); if (ev) obj_drop(ev); hm_del_id(&g_ghost, slot); ser_note(*slot); }
+    *slot = k; g_ghost_puts++;
+}
 static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external textures (mtl_ext_tex), never initialized by the game
     pthread_mutex_lock(&g_smu);
-    nvn_hmap *m = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k) ? &g_by_serial : &g_ghost;
+    nvn_hmap *m = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k) || nvn_hm_get(&g_tex_pooled, &k) ? &g_by_serial : &g_ghost;
     id old = hm_get_id(m, &k);
     if (old) obj_drop(old);
-    else if (m == &g_ghost) {
-        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
-        if (*slot) { id ev = hm_get_id(&g_ghost, slot); if (ev) obj_drop(ev); hm_del_id(&g_ghost, slot); ser_note(*slot); }   // the evicted serial resolves anew too
-        *slot = k; g_ghost_puts++;
-    }
+    else if (m == &g_ghost) ghost_slot(k);
+    else if (g_ghost.n && (old = hm_get_id(&g_ghost, &k))) { obj_drop(old); hm_del_id(&g_ghost, &k); }   // a ghost until a descriptor held it
     hm_put_id(m, &k, o); ser_note(k);
     pthread_mutex_unlock(&g_smu);
+}
+// A texture pool descriptor holds the serial (its first registration, mtl_reg_tex) or no longer does (its last ID registered again, treg_unlink). While one does, tex_put keeps the
+// texture in g_by_serial as for a live object. Ocarina of Time finalizes its texture objects once their descriptors are in the pool, as NVN allows (the GPU reads the descriptor),
+// so its ~13,000 level textures were ghosts: each bindless pool walk (pool_gpu) put them all through the 512-entry ring, each put evicting another and noting two serial changes
+// (72 million in two minutes of loading), which sent the next draw's walk round again, and the textures the ring dropped were made and uploaded anew inside one frame, which held
+// every copy (27 GB). The last descriptor going hands a texture no live object owns back to the ghost ring. Caller holds g_rmu
+static void tex_pooled(uint64_t k, int on) {
+    pthread_mutex_lock(&g_smu);
+    if (on) {
+        nvn_hm_put(&g_tex_pooled, &k, (void *)1);
+        id g = g_ghost.n ? hm_get_id(&g_ghost, &k) : nil;
+        if (g && !hm_get_id(&g_by_serial, &k)) { hm_put_id(&g_by_serial, &k, g); hm_del_id(&g_ghost, &k); }   // the same object: no note, the ID caches stay valid
+    } else if (nvn_hm_del(&g_tex_pooled, &k) && !nvn_hm_get(&g_tex_live, &k)) {
+        id o = hm_get_id(&g_by_serial, &k);
+        if (o) { id was = hm_get_id(&g_ghost, &k); if (was) obj_drop(was); else ghost_slot(k); hm_put_id(&g_ghost, &k, o); hm_del_id(&g_by_serial, &k); }
+    }
+    pthread_mutex_unlock(&g_smu);
+}
+static void tex_pool_gone(uint64_t k) {   // its memory pool is finalized (treg_drop_pool_views): a texture only descriptors held goes, as Finalize takes a live one's. Caller holds g_rmu
+    pthread_mutex_lock(&g_smu); int drop = k && nvn_hm_get(&g_tex_pooled, &k) && !nvn_hm_get(&g_tex_live, &k); pthread_mutex_unlock(&g_smu);
+    if (drop) serial_del(k);
 }
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
@@ -3394,14 +3418,13 @@ void mtl_vc_drop(uint64_t ser);
 static void treg_retire_serial(uint64_t ser);
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
-    pthread_mutex_lock(&g_smu); int was_live = nvn_hm_del(&g_tex_live, &t->serial) != NULL; free(nvn_hm_del(&g_image_desc, &t->serial));
+    pthread_mutex_lock(&g_smu); int was_live = nvn_hm_del(&g_tex_live, &t->serial) != NULL, pooled = nvn_hm_get(&g_tex_pooled, &t->serial) != NULL; free(nvn_hm_del(&g_image_desc, &t->serial));
     pthread_mutex_lock(&g_cpu_tex_mu);
     void *pool = nvn_hm_del(&g_cpu_tex, &t->serial);
     if (pool && t->pool && t->mem) nvn_hm_put(&g_cpu_tex_retired, &t->serial, pool);
     pthread_mutex_unlock(&g_cpu_tex_mu);
     pthread_mutex_unlock(&g_smu);
-    serial_del(t->serial);
-    mtl_vc_drop(t->serial);
+    if (!pooled) { serial_del(t->serial); mtl_vc_drop(t->serial); }   // a descriptor still holds it: its texture and views stay (tex_pooled)
     // Only the first release of a serial retires its descriptors. NVNtexture is plain data: Breath of the Wild copies texture objects and finalizes each copy
     // (about 100 a frame), so the same serial came back here again and again while its descriptor list grew (5,900 IDs registered with one serial); each walk
     // found them all retired already, and the walks took about as much of the game thread as the game. Descriptors registered after the first release are
@@ -4858,7 +4881,7 @@ static void treg_unlink(int id_) {
     if (!r->ok || !r->t.serial) return;
     if (r->prev) g_treg[r->prev - 1].next = r->next;
     else if (r->next) nvn_hm_put(&g_treg_serial, &r->t.serial, (void *)(uintptr_t)r->next);
-    else nvn_hm_del(&g_treg_serial, &r->t.serial);
+    else { nvn_hm_del(&g_treg_serial, &r->t.serial); tex_pooled(r->t.serial, 0); }   // its last descriptor
     if (r->next) g_treg[r->next - 1].prev = r->prev;
     r->prev = r->next = 0;
 }
@@ -5029,7 +5052,7 @@ static void treg_gone(treg_t *r) {
 static void treg_drop_pool_views(const void *pool) {
     os_unfair_lock_lock(&g_rmu);
     vc_drop_pool(pool); tb2_drop_all();   // the rows of any pool's buffer: a finalized pool's would keep its buffer alive
-    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && (const void *)g_treg[i].t.pool == pool) treg_gone(&g_treg[i]);
+    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && (const void *)g_treg[i].t.pool == pool) { treg_gone(&g_treg[i]); tex_pool_gone(g_treg[i].t.serial); }
     os_unfair_lock_unlock(&g_rmu);
 }
 void mtl_reg_tex_gone(int tid) {
@@ -5055,6 +5078,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
             pthread_mutex_lock(&g_smu); rr->retired = !nvn_hm_get(&g_tex_live, &t->serial); pthread_mutex_unlock(&g_smu);
             rr->next = (int)(uintptr_t)nvn_hm_get(&g_treg_serial, &t->serial);
             if (rr->next) g_treg[rr->next - 1].prev = id_ + 1;
+            else tex_pooled(t->serial, 1);   // the serial's first descriptor
             nvn_hm_put(&g_treg_serial, &t->serial, (void *)(uintptr_t)(id_ + 1));
         }
         if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);

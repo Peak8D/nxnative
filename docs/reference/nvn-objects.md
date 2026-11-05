@@ -156,6 +156,13 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Fix:** dead serials go to a 512-entry table (`tex_put`, `g_ghost`; the memory line's `finalized textures still referenced`).
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (the HUD captures, the 640×360 buffers; found while fixing GitHub issue #9).
 
+### Finalized textures a texture pool descriptor still holds went through the ghost table
+
+- **Symptom:** a level loads at 20 to 30 s a frame; the replay thread spends most of its time in `pool_gpu` → `tex_by_id` → `treg_tex`, and the memory line's GPU allocated climbs past Metal's working set until uploads fail with `kIOGPUCommandBufferCallbackErrorOutOfMemory` (27 GB in one run, the Mac swapping).
+- **Cause:** the game finalizes its texture objects once their descriptors are in the texture pool, as NVN allows (the GPU reads the descriptor). Their serials were dead, so they resolved through the 512-entry ghost table: a bindless pool walk over ~13,000 IDs evicted and remade them all, each put noting two serial changes (72 million in two minutes of loading), so the next draw walked again, and the textures remade inside one frame stayed alive until that frame's submission completed.
+- **Fix:** a serial a registered descriptor holds stays in `g_by_serial` (`tex_pooled`, `g_tex_pooled`); its last descriptor going hands it back to the ghost table, and its memory pool's finalization takes it (`tex_pool_gone`). Finalize keeps such a serial's texture and views. `check_t_cpu_tex` puts 576 finalized, registered textures through the table and checks that none is evicted and that each costs one note.
+- **Found on:** The Legend of Zelda: Ocarina of Time (Switch 2), its first level's load.
+
 ### A replay's own objects take serials above a capture's
 
 - **Symptom:** `nvn_replay` aborts on a game's capture with `-[NvProg width]: unrecognized selector` (from `rt_dims`) or `-[NvProg mipmapLevelCount]`: a render target resolves to a program.

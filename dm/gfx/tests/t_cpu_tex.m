@@ -52,6 +52,32 @@ static void descriptor_replacement(void) {
     mtl_reg_tex(1,NULL,NULL);
     CHECK(!g_treg_serial.n, "clearing descriptors removes serial links");
 }
+// Textures whose objects are finalized while a texture pool descriptor holds them (Ocarina of Time does so for its whole level): more of them than the 512-entry ghost ring once
+// made each pool walk evict and remake them all, two serial notes each. Stand-in objects: the serial table holds whatever resolution made
+static void pooled_dead_serials(void) {
+    enum { M = NGHOST + 64, ID0 = 100 };
+    static tex_t t[M]; static id obj[M]; uint8_t mem[1]; pool_t pool = {.mem=&mem[0]};
+    for (int i = 0; i < M; i++) { t[i].serial = nvn_new_serial(); t[i].pool = &pool; t[i].mem = &mem[0]; mtl_tex_init(&t[i]); mtl_reg_tex(ID0 + i, &t[i], NULL); mtl_tex_release(&t[i]); obj[i] = [NSObject new]; }
+    uint64_t gen = g_ser_gen, puts = g_ghost_puts;
+    for (int i = 0; i < M; i++) tex_put(t[i].serial, obj[i]);
+    int kept = 0; for (int i = 0; i < M; i++) kept += tex_get(t[i].serial) == obj[i] && hm_get_id(&g_by_serial, &t[i].serial) == obj[i];
+    CHECK(kept == M, "finalized textures a descriptor holds stay in the serial table, past the ghost ring's size");
+    CHECK(g_ser_gen - gen == M && g_ghost_puts == puts, "one note each and no ghost eviction");
+    tex_t dead = {.serial=nvn_new_serial()}; mtl_tex_init(&dead); mtl_tex_release(&dead); id d = [NSObject new]; tex_put(dead.serial, d);
+    CHECK(hm_get_id(&g_ghost, &dead.serial) == d && !hm_get_id(&g_by_serial, &dead.serial), "a finalized texture no descriptor holds is still a ghost");
+    mtl_reg_tex(ID0 + M, &dead, NULL);
+    CHECK(hm_get_id(&g_by_serial, &dead.serial) == d && !hm_get_id(&g_ghost, &dead.serial), "a ghost a descriptor comes to hold moves to the serial table as the same object");
+    mtl_reg_tex(ID0 + M, NULL, NULL);
+    CHECK(hm_get_id(&g_ghost, &dead.serial) == d && !hm_get_id(&g_by_serial, &dead.serial), "its last descriptor going makes it a ghost again");
+    for (int i = 0; i < M / 2; i++) mtl_reg_tex(ID0 + i, NULL, NULL);
+    int ghosts = 0; for (int i = 0; i < M / 2; i++) ghosts += hm_get_id(&g_ghost, &t[i].serial) == obj[i] && !hm_get_id(&g_by_serial, &t[i].serial);
+    CHECK(ghosts == M / 2 && hm_get_id(&g_by_serial, &t[M - 1].serial) == obj[M - 1], "unregistered ones become ghosts, the registered ones stay");
+    treg_drop_pool_views(&pool);
+    int left = 0; for (int i = M / 2; i < M; i++) left += hm_get_id(&g_by_serial, &t[i].serial) != nil;
+    CHECK(left == 0, "their memory pool's finalization takes the textures only descriptors held");
+    for (int i = M / 2; i < M; i++) mtl_reg_tex(ID0 + i, NULL, NULL);
+    CHECK(!g_tex_pooled.n, "no serial is left marked as held");
+}
 static void finalized_upload(int write_after_record) {
     const size_t len = 262144;
     uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -127,7 +153,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     tex_t z = {0}; mtl_tex_cpu_written(&z);
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
-    retired_classification(); descriptor_replacement();
+    retired_classification(); descriptor_replacement(); pooled_dead_serials();
     if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }
