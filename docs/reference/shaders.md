@@ -66,6 +66,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Pairing:** control sections are shared between programs, so pair by entry, never by searching for code near a control.
 - **Found on:** [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md) (BAHS version 9).
 
+### Stray BAHS entries
+
+- **Symptom:** `Ampere instruction 481 at 0x0 … is not implemented` for a compute shader from `agl_common.sharcb`: its code area starts with an SPH, as a graphics shader's does. The split's map has a few keys no program of the file makes.
+- **Cause:** `bahs_shaders` scans the table area for anything that reads as an entry. Bytes inside a control section can, and such a match pairs one record's control section with another's code. The binary array that lists the real entries was read only for pairing, and up to 1 % of matches outside it were let through.
+- **Fix:** `bahs_variations` returns the entries the array lists, and `bahs_shaders` keeps only those when the array reads back. Otherwise every match is kept, as before. `dm/tools/tests/test_split_bahs_strays.py` plants one.
+- **Found on:** The Legend of Zelda: Ocarina of Time (`0400486024DEC000`): 4 strays, in agl_common, agl_technique, agl_technique_pfx and AglShader. Three lie inside a control section, and each pairs a control section and code that real entries use with others; one is the 0x481 failure. The split now has 42,342 shaders. Donkey Kong Bananza's agl_common had one too (1,556 matches, 1,555 records): its profile's tables were split before, so they keep that key until the next split.
+
 ### Zstd files recognised by their magic
 
 - **Symptom:** `shader_split.py` finds 0 shaders in a RomFS of zstd files named `.zst`.
@@ -483,6 +490,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** the pack's records start at +0x10 in one SDK's version and +0x14 in another's, by the words in its header (Donkey Kong Bananza 0x300, 0x6efeff, 0xc0000; [Splatoon Raiders](../../dm/games/0400380020056000/README.md) 0x40100, 0x80300, 0x90, 0x20c00).
 - **Fix:** `ndsr_shaders` in `shader_split.py` takes the start at which more of the first 16 records point at an NVN2 control section.
 - **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md).
+
+### NDSR items and the NDVE movie upscaler
+
+- **Symptom:** the shader split leaves out a movie upscaler's shaders with no red line: `Movie/Ndve/*.dat.zs` holds 22 NVN2 control sections, and the shader map has none of them (at run time they would be "not in the shader map").
+- **How it is stored:** an NDVE file is a header (0x28 bytes in version 5, `u16` at +4), an NDSR pack whose length is at +0xc, and an RLA1 container whose length is at +0x10. The NDSR pack is a list of 8-byte items `{u32 offset, u32 length << 4 | type}`: control sections (types 0 / 3 / 6), code areas (7) and data (9, 0xb, 0xc for the network's 1 MB of weights, 0xd, 0xe); a control item's code is the item after it. agl's `agl_ndsr.pck` has its data items in pairs, so reading it as 16-byte records worked there. The NDVE pack has an odd number between its two compute shaders. RLA1 ends in a footer `[u32 length][u32 count]{u32 ID, u32 offset, u32 length}×count [u32 footer offset]`, then the magic, the `u32` `'RLA1'` (bytes `1ALR`). Each blob it lists is `{u32 shader count, u32 data count, {offset, length}×data, {control offset, control length, code length, 0}×shaders}`, each code area right after its control section.
+- **Cause:** the split's prefilter dropped the file, which holds no magic it looks for. Read as 16-byte records, the NDSR pack lost its second shader, and nothing read RLA1.
+- **Fix:** `shader_split.py` `ndsr_shaders` walks items, not records; it gives `agl_ndsr.pck` the same 43 records it gave before. `ndve_shaders` and `rla1_shaders` read the rest, and the prefilter lets NDSR and NDVE files through. `dm/tools/tests/test_split_ndve.py` builds both kinds of file.
+- **Found on:** The Legend of Zelda: Ocarina of Time (`0400486024DEC000`, Switch 2, v131072; not brought up yet): `Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs`, 2 NDSR and 9 + 9 + 1 + 1 RLA1 compute shaders, all distinct. With them its split had 42,346 shaders (42,342 once its [stray BAHS entries](#stray-bahs-entries) were dropped).
 
 ## Control sections and code
 
@@ -1087,6 +1102,16 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Limit:** only the comparisons. The compilers set .FTZ on nearly every float instruction of every shader, so it is in effect a mode of the whole shader, and Metal has none (`MTLCompileOptions` has math modes, no denormal control). Flushing the arithmetic would be about 3.3 million more sites in Mario Kart World, so its FADD, FMUL and FFMA keep denormals. Four denormal weights can still add up to a normal sum, which NVIDIA sees as zero; it stays finite, so it makes no NaN.
 - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md): its deferred lighting `635061c90d75a8d1` normalises four depth-weighted half-resolution samples by `1 / sum` only where `FSETP.NEU.FTZ` says the sum is not zero. No Switch 1 game has shown the symptom; Maxwell's comparisons follow for the same semantics (the flag is on all of them in the 8 Switch 1 games counted).
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_alu.py` (`CompareFtz`, on the game's encoding) and `test_dmsh_maxwell_ftz.py`.
+
+### Ampere instructions new in The Legend of Zelda: Ocarina of Time
+
+- **Symptom:** `Ampere instruction 243 at 0x… is not implemented` (10 compute shaders: agl_common's colour encoders, `FoliageShader.sharcb`), `Ampere instruction 3a9 …` (6 of `FoliageShader`'s), `ISBERD mode b8 in a task or mesh shader` (one of `AglShader.sharcb`'s task shaders) in the shader build; those shaders are left out.
+- **Fix:** read from the instructions around each use, with no disassembler at hand; each emitter takes only the encoding the game has and refuses any other.
+  - F2IP.U8.F32 (0x243, the reg-reg form of ALU 0x043; bits 72..95 = 0x0004, c = RZ), `AF2ip` in `InstEmitAmpereAlu.cs`: two floats to bytes, a into bits 8..15 and b into bits 0..7, as F2FP orders its halves. agl_common's RGB → BT.709 YCbCr encoder (coefficients 0.183 / 0.614 / 0.062, ±0.439, offsets 16/255 and 0.5) converts each saturated value times 255 and joins two results with PRMT 0x5410 into the word it stores. Only this order gives Y in pixel order and Cb before Cr (NV12). FoliageShader packs RGBA8 the same way. Rounding to nearest even and the byte's saturation follow F2I's fields (78..80 = 0, size 75..77 = 0), as no use tells them apart.
+  - ATOMG.CAS (0x3a9, beside ATOMG's 0x3a8 as ATOMS.CAS's 0x38d is beside ATOMS's 0x38c), `AAtomgCas` in `InstEmitAmpereMem.cs`: ATOMG's address, Rb the expected value, Rc the new one, Rd the old value. FoliageShader puts index + 1 into an empty slot (expected 0) and, on an old value other than 0, takes old − 1 as the index already there, which only the old value makes sense of. 32-bit only.
+  - ISBERD mode 0xb8 in a task shader: a word of its own stage output, where AST 0xb8 stores. `5d3a096025e375a1` stores its payload word 0x10 and reads it back at the next instruction.
+- **Found on:** The Legend of Zelda: Ocarina of Time (`0400486024DEC000`, Switch 2, v131072; not brought up yet): with these, all 42,342 of its shaders translate, and the 17 build to Metal libraries. Their pictures are not checked: the game has not run yet.
+- **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_mem.py` (`OcarinaOfTime`, `StageMemory`).
 
 ### Barrier moves around warp shuffles
 
