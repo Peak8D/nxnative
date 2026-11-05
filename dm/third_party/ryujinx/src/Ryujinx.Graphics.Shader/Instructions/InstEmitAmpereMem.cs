@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x3a9, InstName.Atom, AAtomgCas, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -137,14 +138,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 // A task or mesh shader's stage input (QueryAmpereStageMemory). Mode 0x78: its workgroup's number; 0x38: a word of the payload its task wrote, [Ra + offset];
                 // 0x34: a 16-bit entry of it (Fast Fusion's ship and collectible mesh shaders read a halfword array at [index * 2 + 0x18] that their task shaders write
                 // with stage output mode 0xb4), zero-extended
+                // 0xb8: a word of its own stage output, where AST 0xb8 stores (The Legend of Zelda: Ocarina of Time's task shader 5d3a096025e375a1 stores its payload word 0x10
+                // with AST and reads it back with ISBERD at the next instruction)
                 int mode = x.Bits(72, 80);
 
-                if (mode != 0x78 && mode != 0x38 && mode != 0x34)
+                if (mode != 0x78 && mode != 0x38 && mode != 0x34 && mode != 0xb8)
                 {
                     throw AFail(context, $"ISBERD mode {mode:x2} in a task or mesh shader");
                 }
 
-                Operand addr = mode == 0x78 ? Const(stage[0]) : context.IAdd(AGpr(x.Ra), Const(stage[1] + (int)x.SignedField(40, 64)));
+                Operand addr = mode == 0x78 ? Const(stage[0]) : context.IAdd(AGpr(x.Ra), Const((mode == 0xb8 ? stage[2] : stage[1]) + (int)x.SignedField(40, 64)));
 
                 if (mode == 0x34)
                 {
@@ -379,6 +382,25 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand res = EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)x.Bits(87, 91), (AtomSize)x.Bits(73, 76), lo, hi, Register(x.Rb, RegisterType.Gpr));
 
             ASet(context, x, res);
+        }
+
+        // ATOMG.CAS Rd, [Ra + UR + offset], Rb (expected), Rc (new value): Rd = the old value, as ATOMG's other operations. Read from The Legend of Zelda: Ocarina of Time's
+        // FoliageShader (6 compute shaders, 32-bit, Ra a register pair): it puts index + 1 into an empty slot with an expected 0, and on an old value other than 0 takes
+        // old - 1 as the index already there. Size 73..76 (32-bit only) as ATOMG's; any other size stops the shader
+        public static void AAtomgCas(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if ((AtomSize)x.Bits(73, 76) is not (AtomSize.U32 or AtomSize.S32))
+            {
+                throw AFail(context, $"ATOMG.CAS of size {x.Bits(73, 76)}");
+            }
+
+            (Operand lo, Operand hi) = AGlobalAddress(context, x, 70, 64, 0);
+            Operand expected = x.Rb >= RegisterConsts.RegisterZeroIndex ? Const(0) : context.Copy(Register(x.Rb, RegisterType.Gpr));
+            Operand value = x.Rc >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rc, RegisterType.Gpr);
+
+            ASet(context, x, context.AtomicCompareAndSwap(StorageKind.GlobalMemory, lo, hi, expected, value));
         }
 
         // MEMBAR: the order of this thread's memory operations

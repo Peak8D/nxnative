@@ -151,6 +151,12 @@ class StageMemory(Translated):
     def test_input_is_at_its_offset(self):   # 0x10 + 0x20
         self.assertRegex(self.msl(self.INPUT, self.KEEP_R19), r'as_type<float>\(_\d+\[12\]\)')
 
+    # ISBERD R19, [RZ + 0x10], mode 0xb8: a task reading back its own payload word (Ocarina of Time's 5d3a096025e375a1 +0x80, after its AST of the same word)
+    OWN_OUTPUT = (0x000fe2000000b800, 0x00001000ff137923)
+
+    def test_own_output_is_read_where_ast_stores_it(self):   # 0x120 + 0x10
+        self.assertRegex(self.msl(self.OWN_OUTPUT, self.KEEP_R19), r'as_type<float>\(_\d+\[76\]\)')
+
     def test_word_store_goes_to_the_outputs(self):   # 0x120 + 0x80
         self.assertIn('0 + 416', self.msl(self.ATTRIBUTE))
 
@@ -200,6 +206,44 @@ def mov(rd, value):   # MOV Rd, imm32: values the tests can see in the output
 
 def sts(offset, rb):   # STS.U32 [RZ + offset], Rb: keeps its result
     return inst(0x000fe80000000800, offset << 40 | rb << 32 | 0xff << 24 | 0x7388)
+
+
+def f32(v): return struct.unpack('<I', struct.pack('<f', v))[0]
+
+
+class OcarinaOfTime(Translated):
+    """The Legend of Zelda: Ocarina of Time's compute shaders, in the game's encodings with other registers: F2IP (agl_common's YCbCr encoder, FoliageShader) and ATOMG.CAS (FoliageShader)"""
+    @staticmethod
+    def f2ip(rd, ra, rb, hi=0x000fe200000004ff): return inst(hi, rb << 32 | ra << 24 | rd << 16 | 0x7243)   # F2IP.U8.F32 Rd, Ra, Rb, RZ (aaa785ced92a88ef +0x4e0)
+    # ATOMG.CAS R0, [R2.64], R8, R9 (c144d8f734fbe228 +0x8830 on base register R2)
+    ATOMG_CAS = (0x000ea400001ee109, 0x00000008020073a9)
+
+    def msl(self, *code):
+        msl = self.translate(b''.join(code) + inst(*EXIT), shared=0x400)
+        return msl[msl.index('kernel void'):]
+
+    def test_f2ip_packs_a_above_b_rounded_and_saturated(self):
+        # each value rounded to nearest even, then max 0 (first, so that dmsh_build's precise::max turns a NaN into 0) and min 255, converted; a's byte shifted by 8 and b's ORed in
+        msl = self.msl(mov(1, f32(300.0)), mov(2, f32(17.5)), self.f2ip(3, 1, 2), sts(0x20, 3))
+        def byte(v, n): return (rf'float (?P<r{n}>_\d+) = rint\({v}\);\s+float (?P<x{n}>_\d+) = fast::max\((?P=r{n}), 0\.0\);\s+float (?P<n{n}>_\d+) = fast::min\((?P=x{n}), 255\.0\);\s+'
+                                rf'uint (?P<u{n}>_\d+) = uint\((?P=n{n})\);\s+')
+        self.assertRegex(msl, byte(r'300\.0', 'a') + r'int (?P<s>_\d+) = int\((?P=ua)\) << 8;\s+' + byte(r'17\.5', 'b') + r'int _\d+ = (?P=s) \| int\((?P=ub)\);')
+
+    def test_f2ip_of_another_form_is_refused(self):   # bit 72 also set: a signed destination in F2I's layout, not seen
+        with self.assertRaises(AssertionError) as e: self.msl(self.f2ip(3, 1, 2, hi=0x000fe200000005ff), sts(0x20, 3))
+        self.assertIn('F2IP other than', str(e.exception))   # AF2ip takes the two forms the game has: round to nearest and .TRUNC
+
+    def test_atomg_cas_returns_the_old_value(self):
+        # compare R8, swap in R9, at an address no storage buffer holds (the memory pools' helper does the swap); the STS waits on every barrier, as the game's ISETP waits on the CAS's,
+        # and stores the result as it is, not turned into a flag
+        wait_sts = inst(0x03ffe80000000800, 0x20 << 40 | 0 << 32 | 0xff << 24 | 0x7388)
+        full = self.translate(mov(2, 0x1000) + mov(3, 0) + mov(8, 0) + mov(9, 7) + inst(*self.ATOMG_CAS) + wait_sts + inst(*EXIT), shared=0x400)
+        self.assertIn('atomic_compare_exchange', full)
+        kernel = full[full.index('kernel void'):]
+        # address 0x1000:0, expected 0, new value 7 into the helper; what it returns is stored
+        self.assertRegex(kernel, r'int (?P<lo>_\d+) = 4096;\s+int (?P<hi>_\d+) = 0;\s+int (?P<e>_\d+) = 0;\s+int (?P<v>_\d+) = 7;\s+'
+                                 r'int (?P<r>_\d+) = _\d+\((?P=lo), (?P=hi), (?P=e), (?P=v), [^;]*\);\s+int (?P<rd>_\d+) = (?P=r);\s+_\d+\[8\] = uint\((?P=rd)\);')
+        self.assertNotRegex(kernel, r'\? 1u : 0u|\? 1 : 0')
 
 
 class Shared(Translated):
