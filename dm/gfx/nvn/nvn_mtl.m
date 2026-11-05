@@ -982,6 +982,21 @@ static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also end
 static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
 static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
 static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+// What a command buffer segment holds, printed when it fails: a GPU hang names no encoder, so the line gives its frame, its passes and its first task / mesh draws
+typedef struct { uint64_t frame, pass0, pass1; int n, ind; char k[12][3][17]; int wg[12]; } seg_info;
+static seg_info g_segi;
+static void segi_reset(void) { g_segi.n = g_segi.ind = 0; g_segi.pass0 = g_stat_pass + 1; }
+static void segi_mesh(const char *t, const char *m, const char *f, int wg, int ind) {
+    g_segi.ind += ind != 0;
+    if (g_segi.n < 12) { const char *s[3] = {t, m, f}; for (int i = 0; i < 3; i++) snprintf(g_segi.k[g_segi.n][i], 17, "%s", s[i]); g_segi.wg[g_segi.n] = wg; }
+    g_segi.n++;
+}
+static seg_info *segi_take(void) { seg_info *s = malloc(sizeof *s); *s = g_segi; s->frame = atomic_load(&g_cur_frame); s->pass1 = g_stat_pass; segi_reset(); return s; }
+static void segi_print(const seg_info *s) {
+    char b[1600]; int o = snprintf(b, sizeof b, "frame %llu, passes %llu-%llu, %d task / mesh draws (%d indirect)", (unsigned long long)s->frame, (unsigned long long)s->pass0, (unsigned long long)s->pass1, s->n, s->ind);
+    for (int i = 0; i < MIN(s->n, 12) && o < (int)sizeof b - 80; i++) o += snprintf(b + o, sizeof b - o, "%s task %s mesh %s fragment %s %d", i ? ";" : ":", s->k[i][0], s->k[i][1], s->k[i][2], s->wg[i]);
+    MLOG("[RED] the failed segment held %s", b);
+}
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
@@ -1735,7 +1750,7 @@ uint64_t mtl_sub_commit(void) {
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; for (dispatch_block_t block in commit_blocks) block(); }];
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
-    NSString *cctx = @(cctx_snap());
+    NSString *cctx = @(cctx_snap()); seg_info *si = segi_take();
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
     pthread_mutex_lock(&g_post_mu);
     if (!atomic_load(&pr->claimed) && pr->fence) MDIE("post ring: the writes of fence %llu never ran", (unsigned long long)pr->fence);
@@ -1745,7 +1760,8 @@ uint64_t mtl_sub_commit(void) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) { MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); segi_print(si); } MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+        free(si);
         post_complete(fence, c0, c1);
         defer_drain();
     }];
@@ -4261,8 +4277,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (!c.texture) continue;
         uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d view format %#x (base texture NVN format %#x)", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
-        PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
-           (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
+        PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu mem=%p nvn=%#x/%#x %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
+           (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice, R.rt.color[i]->mem, R.rt.color[i]->d.format, R.rt.color[i]->d.flags,
            c.loadAction == MTLLoadActionClear ? "clear" : c.loadAction == MTLLoadActionDontCare ? "dontcare" : "load", (__bridge void *)(c.texture.parentTexture ? c.texture.parentTexture : c.texture));
     }
     {   // Depth and stencil planes are counted separately (combined format 5 bytes = depth 4 + stencil 1; when only one is attached only that one is counted)
@@ -4272,8 +4288,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         uint64_t db = dt ? (comb ? whole / 5 * 4 : whole) : 0, sb = stt && stt != dt ? (comb ? whole / 5 : whole) : stt ? whole - db : 0;
         if (dt) { natt++; g_bw_store += db; if (pd.depthAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += db; nload++; } }
         if (stt) { natt += !dt; g_bw_store += sb; if (pd.stencilAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += sb; nload += !dt; } }
-        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu %s", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat,
-                   (unsigned long)dt.width, (unsigned long)dt.height, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
+        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu mtl=%p mem=%p nvn=%#x/%#x %s", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat, (unsigned long)dt.width, (unsigned long)dt.height,
+                   (__bridge void *)(dt.parentTexture ? dt.parentTexture : dt), R.rt.depth->mem, R.rt.depth->d.format, R.rt.depth->d.flags, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
         else if (stt) PD("P %llu s ser=%llu fmt=%lu %lux%lu %s (stencil only)", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)stt.pixelFormat,
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
@@ -12249,7 +12265,7 @@ static int cut_draws(void) { static int v = -1; if (v < 0) { const char *e = get
 static uint64_t g_cut_draw0, g_cuts, g_copy_cuts;
 // The count starts with the submission (mtl_sub_begin). It used to start at the submission's first sub_cut, which only a render target change reaches (OP_SET_RT): the draws a
 // submission makes into the target it inherited, before its first target change, were never counted, and the first segment came that many draws late
-static void sub_cut_begin(void) { g_cut_draw0 = g_stat_draw; }
+static void sub_cut_begin(void) { g_cut_draw0 = g_stat_draw; segi_reset(); }
 // DM_FSTEP_PROBE_RAMP=1 (default) / 0 / ab: a frame-step probe's grace is renewed while its frames keep getting cheaper (nvn_fstep.h FSTEP_RAMP), the time macOS's GPU clock takes to rise for the shorter deadline
 static int probe_ramp_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_FSTEP_PROBE_RAMP", 1); return m; }
 int mtl_probe_ramp_on(void) { return sw_on(probe_ramp_mode()); }
@@ -12264,11 +12280,13 @@ static void sub_cut(void) {
     uint64_t f = atomic_load(&g_cur_frame); gpu_tag_begin(f);
     uint32_t k = g_seg++; seg_clk *sc = NULL;   // reports encoded so far keep this segment's GPU times (seg_ts)
     if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); }
-    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    MTL4CommitOptions *o = [MTL4CommitOptions new]; seg_info *si = segi_take();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error);
+                        if (![cb.error.description containsString:@"InnocentVictim"]) segi_print(si); }
+        free(si);
     }];
     res_commit();
     [g_cb endCommandBuffer];
@@ -12495,6 +12513,10 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+                if (passdump()) { const view_t *v = &r->dview;
+                    PD("Y set_rt cmd=%p n=%d c0=%llu c1=%llu d=%llu dview=%d (levels %d:%u+%u layers %d:%u+%u format %d:%#x target %d:%u dsmode %d:%u)%s", p, r->n, r->n > 0 && r->color[0] ? (unsigned long long)r->color[0]->serial : 0ull,
+                       r->n > 1 && r->color[1] ? (unsigned long long)r->color[1]->serial : 0ull, r->depth ? (unsigned long long)r->depth->serial : 0ull, r->has_dview,
+                       v->set_levels, v->base_level, v->nlevels, v->set_layers, v->min_layer, v->nlayers, v->set_format, v->format, v->set_target, v->target, v->set_dsmode, v->dsmode, g_enc ? " (a pass is open)" : ""); }
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
@@ -12547,7 +12569,8 @@ void mtl_exec(const uint8_t *p) {
                 }
                 if (c->depth_mask) { R.clear_d = 1; R.cd = c->depth; }
                 if (c->stencil_mask) { R.clear_s = 1; R.cs = (uint32_t)c->stencil; }
-                PD("c %llu depth-stencil clear recorded ser=%llu depth=%g depth_mask=%d stencil=%d stencil_mask=%#x", g_stat_pass, R.rt.depth ? (unsigned long long)R.rt.depth->serial : 0ull, c->depth, c->depth_mask, c->stencil, c->stencil_mask);
+                if (passdump()) { uint64_t nvn_clear_site(const void *); PD("c %llu depth-stencil clear recorded ser=%llu depth=%g depth_mask=%d stencil=%d stencil_mask=%#x scissor=%d:%d,%d,%d,%d site=%#llx", g_stat_pass,
+                    R.rt.depth ? (unsigned long long)R.rt.depth->serial : 0ull, c->depth, c->depth_mask, c->stencil, c->stencil_mask, R.has_sc, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long long)nvn_clear_site(c)); }
                 break;
             }
             case OP_MULTI_DRAW:

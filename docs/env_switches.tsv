@@ -118,6 +118,7 @@ DM_NVN_CBDUMP	diagnostic	`=<dir>`: saves each draw's whole uniform blocks as `F<
 DM_NVN_CBDUMP_KEY	diagnostic	`=<shader key>[,<shader key>…]`: limits `DM_NVN_CBDUMP` to draws using those shaders (read again each frame, so `DM_CTL`'s `env` changes it); for a vertex shader key also saves the draw's vertex streams, index buffer, storage buffers and texture buffers
 DM_NVN_CBLOG	diagnostic	`=1` logs the command memory the game adds to command buffers (`AddCommandMemory`: the first 60, then every 500th) and the out-of-memory callbacks
 DM_NVN_CLEARLOG	diagnostic	`=1` logs the first 40 colour clears drawn as a triangle (inside a pass, with a partial channel mask or a partial scissor)
+DM_NVN_CLEAR_SITES	diagnostic	`=1` logs each call site of `nvnCommandBufferClearDepthStencil` (module + offset) with its arguments once, and the pass dump's depth-stencil clear lines name the site of each clear (`site=`)
 DM_NVN_CMDSTAT	diagnostic	`=1` logs every 300 frames the command recording usage: bytes and records per frame, command memory segment sizes, out-of-memory callbacks, host segments, count and bytes per command type
 DM_NVN_COUNT	diagnostic	`1` counts every NVN call (the counting trampolines) and writes the per-frame call lines; off by default (on with a `DM_NVN_TSV` table that has call rows), the count is an atomic add all recording threads share
 DM_NVN_CPUPROF	diagnostic	1 records CPU wall/time/instruction totals by renderer operation; off by default.
@@ -166,8 +167,10 @@ DM_NVN_LOADPROBE	diagnostic	`=1`, `2` or `3`: attachments whose load is skipped 
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels
 DM_NVN_MESH_IND_CPU	diagnostic	`=1`: DrawMeshTasksIndirect's record read on the CPU at encode time and drawn directly (a zero count skipped), with no conversion pass or render pass split
+DM_NVN_MESH_IND_LIMIT	diagnostic	`=<n>`: only the first n DrawMeshTasksIndirect draws of each frame that draw (with `DM_NVN_MESH_IND_CPU=1` a zero count is not one) are drawn, to run the ones that hang the GPU one at a time; the first 24 are logged with their shaders and record
 DM_NVN_MESH_MAX	diagnostic	`=<n>`: with `DM_NVN_MESH_IND_CPU=1`, the task / mesh workgroup count read from each record is capped at n, to tell a long workload from a hang
 DM_NVN_MESH_SKIP	diagnostic	`indirect`, `direct` or `all`: skips those task / mesh draws (DrawMeshTasksIndirect, DrawMeshTasks), to find which of them a GPU hang comes from
+DM_NVN_MESH_SKIP_KEY	diagnostic	`=<key>[,<key>…]`: task / mesh draws whose task or mesh shader is one of these (16 hex digits) are skipped, to rule out one program a GPU hang may come from
 DM_NVN_PASSDUMP	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs every render pass of those frames (attachments, clears, shader keys, bindings, draw state, presents) for the `tbdr_*.py` tools
 DM_NVN_PASSDUMP_ALL	diagnostic	`=1` makes `DM_NVN_PASSDUMP` record every draw and binding change, not only the first per pass and stage, including copies and inline uniform updates
 DM_NVN_PASSGPU	diagnostic	`=<file>` writes the GPU time of each render and compute pass from stage-boundary timestamp counters (off under Metal 4); also gives each dispatch its own encoder

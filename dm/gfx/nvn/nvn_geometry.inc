@@ -615,13 +615,35 @@ static void mesh_tasks_draw(const p_draw *dw) {
     // DM_NVN_MESH_IND_CPU=1 (diagnostic): DrawMeshTasksIndirect's {count, first} read on the CPU at encode time and drawn as DrawMeshTasks (0: skipped), with no conversion
     // pass and no render pass split; a record the GPU writes earlier in the same submission is read before it is written
     static int ind_cpu = -1; if (ind_cpu < 0) { const char *e = getenv("DM_NVN_MESH_IND_CPU"); ind_cpu = e && atoi(e); if (ind_cpu) MLOG("DM_NVN_MESH_IND_CPU=1: indirect task / mesh records read on the CPU"); }
-    p_draw dcpu;
+    p_draw dcpu; int was_ind = dw->ind != 0;
     if (dw->ind && ind_cpu) {
         void *mb; uint64_t mo; if (!mtl_addr(dw->ind, 8, &mb, &mo)) return;
         uint32_t rec[2]; memcpy(rec, (const void *)(uintptr_t)dw->ind, 8); if (!rec[0]) return;
         static int cap = -1; if (cap < 0) { const char *e = getenv("DM_NVN_MESH_MAX"); cap = e ? atoi(e) : 0; if (cap) MLOG("DM_NVN_MESH_MAX=%d: CPU-read task / mesh counts capped", cap); }
         dcpu = *dw; dcpu.ind = 0; dcpu.count = (int32_t)MIN(rec[0], cap > 0 ? (uint32_t)cap : 65535u); dcpu.first = (int32_t)rec[1]; dw = &dcpu;
         { static int n; if (n++ < 8) MLOG("DM_NVN_MESH_IND_CPU: record %u, %u", rec[0], rec[1]); }
+    }
+    // DM_NVN_MESH_IND_LIMIT=<n> (diagnostic): only a frame's first n DrawMeshTasksIndirect draws that draw (with DM_NVN_MESH_IND_CPU, a zero count is not one), to run one at a time
+    // those that hang the GPU; the first 24 are logged with their shaders and record
+    static int ind_lim = -2; if (ind_lim == -2) { const char *e = getenv("DM_NVN_MESH_IND_LIMIT"); ind_lim = e && *e ? atoi(e) : -1; if (ind_lim >= 0) MLOG("DM_NVN_MESH_IND_LIMIT=%d: indirect task / mesh draws per frame", ind_lim); }
+    // DM_NVN_MESH_SKIP_KEY=<key>[,<key>...] (diagnostic): task / mesh draws with one of these task or mesh shaders (16 hex digits) are skipped
+    static const char *skip_keys; static int skip_keys_init; if (!skip_keys_init) { skip_keys_init = 1; skip_keys = getenv("DM_NVN_MESH_SKIP_KEY"); if (skip_keys && *skip_keys) MLOG("DM_NVN_MESH_SKIP_KEY=%s: those task / mesh draws are skipped", skip_keys); else skip_keys = NULL; }
+    if (skip_keys && ((ts && strstr(skip_keys, [[NSString stringWithUTF8String:ts->key] substringToIndex:16].UTF8String)) || strstr(skip_keys, [[NSString stringWithUTF8String:ms->key] substringToIndex:16].UTF8String))) return;
+    if (was_ind) {   // each program's first draw, logged with its place in the frame: when the GPU hangs, the newest ones are the suspects
+        static uint64_t in_frame = ~0ull; static int in_n, in_max, frames_logged, past_logged; uint64_t f = atomic_load(&g_cur_frame);
+        if (f != in_frame) { if (in_n && (frames_logged++ < 8 || in_n > in_max)) MLOG("indirect task / mesh draws in frame %llu: %d%s", (unsigned long long)in_frame, in_n, in_n > in_max ? " (most so far)" : "");
+                             in_max = MAX(in_max, in_n); in_frame = f; in_n = 0; }
+        if (++in_n > 64 && past_logged++ < 48) MLOG("indirect task / mesh draw past #64 (frame %llu, #%d): task %s mesh %s fragment %s, %d workgroups from %d", (unsigned long long)f, in_n,
+                                                    ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", dw->count, dw->first);
+        static const void *seen[512]; static int nseen; const void *id_ = (__bridge const void *)pr; int k = 0; while (k < nseen && seen[k] != id_) k++;
+        if (k == nseen && nseen < 512) { seen[nseen++] = id_; MLOG("indirect task / mesh program first drawn (frame %llu, #%d of the frame): task %s mesh %s fragment %s, %d workgroups", (unsigned long long)f, in_n, ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", dw->count); }
+    }
+    if (was_ind && ind_lim >= 0) {
+        static uint64_t lim_frame = ~0ull; static int lim_n; uint64_t f = atomic_load(&g_cur_frame);
+        if (f != lim_frame) { lim_frame = f; lim_n = 0; }
+        if (lim_n++ >= ind_lim) return;
+        static int logged; if (logged++ < 24) MLOG("indirect task / mesh draw (frame %llu, #%d of the frame): task %s mesh %s fragment %s, %d workgroups from %d%s", (unsigned long long)f, lim_n,
+                                                   ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", dw->count, dw->first, dw->ind ? " (record read on the GPU)" : "");
     }
     uint64_t args = 0;
     if (dw->ind) {   // DrawMeshTasksIndirect: its {count, first} record converted on the GPU before the render pass (ixc_run, with the later ones up to the next buffer write)
@@ -641,6 +663,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; g_mtk.args = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
+    segi_mesh(ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", (int)g_mtk.count, was_ind);
     swrite_note(pr); g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first);
 }

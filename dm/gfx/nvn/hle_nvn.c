@@ -1038,8 +1038,19 @@ NVN(nvnCommandBufferClearColori, void, NVNcommandBuffer *c, int index, const int
 NVN(nvnCommandBufferClearColorui, void, NVNcommandBuffer *c, int index, const uint32_t *rgba, int mask) {
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; for (int i = 0; i < 4; i++) r->rgba[i] = (float)rgba[i];
 }
+enum { CLEAR_SITES = 4096 };
+static struct { const void *rec; uint64_t off; } g_clear_site[CLEAR_SITES]; static _Atomic unsigned g_clear_site_n;
+uint64_t nvn_clear_site(const void *rec) { for (unsigned i = 0; i < CLEAR_SITES; i++) if (g_clear_site[i].rec == rec) return g_clear_site[i].off; return 0; }   // DM_NVN_CLEAR_SITES: a clear record's call site
 NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, uint32_t dmask, int stencil, int smask) {
     p_clear_ds *r = REC(c, OP_CLEAR_DS, p_clear_ds); *r = (p_clear_ds){depth, (int)B(dmask), stencil, smask};
+    {   // DM_NVN_CLEAR_SITES=1 (diagnostic): each call site's first depth-stencil clear, with its arguments as passed; the pass dump's clear lines name the site (nvn_clear_site)
+        static int on = -1; if (on < 0) on = getenv("DM_NVN_CLEAR_SITES") != NULL;
+        uint64_t ra = (uint64_t)__builtin_return_address(0); module_t *m = on ? module_of((void *)ra) : NULL; uint64_t off = m ? ra - (uint64_t)m->base : ra;
+        static uint64_t seen[64]; static int ns; int k = 0; while (on && k < ns && seen[k] != ra) k++;
+        if (on && k == ns && ns < 64) { seen[ns++] = ra;
+            LOG("[nvn] ClearDepthStencil site %s+%#llx: depth %g depth mask %#x stencil %d stencil mask %#x", m ? m->name : "?", (unsigned long long)off, depth, dmask, stencil, smask); }
+        if (on) { unsigned i = atomic_fetch_add(&g_clear_site_n, 1) % CLEAR_SITES; g_clear_site[i].rec = r; g_clear_site[i].off = off; }
+    }
 }
 NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, const float *v) {
     if (n < 0 || first + n > 16) { LOG("[RED] SetViewports first=%d n=%d", first, n); return; }
