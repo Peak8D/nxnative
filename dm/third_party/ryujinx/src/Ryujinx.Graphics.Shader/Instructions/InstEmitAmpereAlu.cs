@@ -32,6 +32,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             alu(0x111, InstName.F2i, AF2i64);
             alu(0x112, InstName.I2f, AI2f64);
             alu(0x045, InstName.I2f, AI2fp);
+            alu(0x043, InstName.F2i, AF2ip);
             alu(0x107, InstName.F2f, AFrnd);
             alu(0x104, InstName.F2f, AF2f);
             alu(0x03e, InstName.F2f, AF2fp);
@@ -412,6 +413,33 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // F2FP.F16.F32.PACK_AB Rd, a, b: a to the high half, b to the low one.
         // .MERGE_C (78): a is not read; b to the low half, the low half of c to the high one. The compiler builds a half pair in two steps, high component first: Pokemon Pokopia's 22,886
         // shaders have F2FP.MERGE_C Rd, RZ, c[3][word + 1], RZ then F2FP.MERGE_C Rd, RZ, c[3][word], Rd, with RZ in a every time (Mesa's NAK documents the same behaviour for OpF2FP)
+        // F2IP: two floats as bytes packed into one register, the way F2FP packs halves: b in bits 0..7, a in bits 8..15, Rc's half (72: .H1) above them.
+        // 74 .NTZ (a NaN to 0), 75 .RELU, 76..78 the format (0 .U8, 1 .S8), 78..80 the rounding (0 nearest even, 3 .TRUNC; 1 and 2 are invalid), from nvdisasm (sm_87).
+        // Taken: .U8.F32.NTZ with either rounding and RZ above, the two forms Ocarina of Time has (21 instructions in compute and mesh shaders); any other stops the shader
+        public static void AF2ip(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            int round = x.Bits(78, 80);
+
+            if (!x.Bit(74) || x.Bit(75) || x.Bits(76, 78) != 0 || round is 1 or 2 || x.Bit(72) || x.Rc != RegisterConsts.RegisterZeroIndex || x.Bits(60, 64) != 0)
+            {
+                throw AFail(context, $"F2IP other than .U8.F32.NTZ with RZ above it (bits 72..80 {x.Bits(72, 80):x2}, Rc {x.Rc})");
+            }
+
+            (ASrc a, ASrc b) = ASecond(context, x, neg: false, abs: false);
+
+            Operand Byte(ASrc s)
+            {
+                Operand v = AFloat(context, s);
+                v = round == 3 ? context.FPTruncate(v) : context.FPRound(v);
+                v = context.FPMinimum(context.FPMaximum(v, ConstF(0f)), ConstF(255f));   // a NaN to 0, as EmitF2I clamps before an unsigned conversion
+
+                return context.FP32ConvertToU32(v);
+            }
+
+            ASet(context, x, context.BitwiseOr(context.ShiftLeft(Byte(a), Const(8)), Byte(b)), AUniform(context));
+        }
+
         public static void AF2fp(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);

@@ -217,6 +217,36 @@ class Shared(Translated):
         self.assertIn('spvSubgroupShuffle(8.96831', msl)   # the address 0x40 as a float's bits; scaled, it would be 0x100 (3.5873e-43)
 
 
+class F2ip(Translated):
+    """F2IP.U8.F32.NTZ (Ocarina of Time: 21 instructions in compute and mesh shaders): two floats as bytes, b in bits 0..7, a in bits 8..15, each rounded (nearest even, or .TRUNC),
+    clamped to 0..255 with a NaN to 0; on the register the atomic reads, from two constant buffer words so nothing folds"""
+    LOAD_B = (0x000fe20000000000, 0x00c00500ff0d7a21)   # FADD R13, RZ, c[3][word 5]
+    LOAD_A = (0x000fe20000000000, 0x00c00600ff0e7a21)   # FADD R14, RZ, c[3][word 6]
+    PACK = (0x000fe200000004ff, 0x0000000d0e0c7243)     # F2IP.U8.F32.NTZ R12, R14, R13, RZ (the game's: R22, R13, R12, RZ)
+    PACK_TRUNC = (0x000fe2000000c4ff, 0x0000000dff0c7243)   # F2IP.U8.F32.TRUNC.NTZ R12, RZ, R13, RZ (the game's: R14, RZ, R14, RZ)
+
+    def msl(self, *code):
+        return self.translate(b''.join(inst(*c) for c in code) + inst(*SUATOM) + inst(*EXIT))
+
+    WORD = r'float (_\d+) = spvFAdd\(0\.0, \(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.{}\);'   # y: word 5 (R13, b), z: word 6 (R14, a)
+
+    def test_two_sources_rounded_clamped_and_packed(self):   # a's byte, rounded to nearest even and clamped, is shifted into bits 8..15; b's is the low byte
+        msl = self.msl(self.LOAD_B, self.LOAD_A, self.PACK)
+        a, b = re.search(self.WORD.format('z'), msl), re.search(self.WORD.format('y'), msl)
+        self.assertTrue(a and b, msl)
+        self.assertRegex(msl, rf'rint\({a.group(1)}\);\s*float _\d+ = fast::max\(_\d+, 0\.0\);\s*float _\d+ = fast::min\(_\d+, 255\.0\);\s*uint (_\d+) = uint\(_\d+\);\s*int _\d+ = int\(\1\) << 8;')
+        self.assertRegex(msl, rf'rint\({b.group(1)}\);\s*float _\d+ = fast::max\(_\d+, 0\.0\);\s*float _\d+ = fast::min\(_\d+, 255\.0\);\s*uint (_\d+) = uint\(_\d+\);\s*int _\d+ = _\d+ \| int\(\1\);')
+        self.assertNotIn('trunc(', msl)
+
+    def test_truncation_with_rz_as_a(self):   # RZ reads 0, so the high byte is 0
+        msl = self.msl(self.LOAD_B, self.PACK_TRUNC)
+        b = re.search(self.WORD.format('y'), msl)
+        self.assertTrue(b, msl)
+        self.assertIn('trunc(0.0)', msl)
+        self.assertRegex(msl, rf'trunc\({b.group(1)}\);\s*float _\d+ = fast::max\(_\d+, 0\.0\);\s*float _\d+ = fast::min\(_\d+, 255\.0\);')
+        self.assertNotIn('rint(', msl)
+
+
 class Pokopia(Translated):
     """Pokemon Pokopia's encodings, on the register the atomic reads: F2FP.MERGE_C (22,886 shaders), F2I from a half (1,067), MEMBAR with ERRBAR (144)"""
     MERGE_FIRST = (0x000fe200000040ff, 0x00c00600ff0c7a3e)   # F2FP.MERGE_C R12, RZ, c[3][word 6], RZ
@@ -397,6 +427,26 @@ class GuardedFixedOverPending(Translated):
         msl = self.translate(inst(*s2r_tid(9)) + inst(*s2r(6, 0x22, guard=0)) + inst(*mov_imm(6, 0x3f800000, guard=8)) + inst(*waiting(self.STORE)) + inst(*EXIT), shared=0x1000)
         self.assertRegex(msl, r'1065353216|1\.0\b')   # the MOV's 1.0 reaches the store when P0 is false
         self.assertIn('gl_LocalInvocationID.y', msl)
+
+
+def bra_to(at, to, pred):   # @Ppred BRA to instruction `to` (its condition predicate PT, bits 87..90)
+    v = 0x947 | pred << 12 | 0xff << 24 | ((((to - at - 1) * 16) // 4) & ((1 << 48) - 1)) << 34 | 7 << 87
+    return (v >> 64) & (2 ** 64 - 1), v & (2 ** 64 - 1)
+
+
+class GuardedLastOfBlock(Translated):
+    """A guarded instruction last in its block, with a deferred write still pending: the block's end commits it, so a false guard must not jump past that
+    commit to the next block (Ocarina of Time's text, vertex shader b19e1bdd247555ec: @!P0 ALD R85, a[0x84], then @P0 FFMA R85 last before the BSYNC that waits
+    on the load; with the jump, every ordinary corner kept R85's old value, each glyph quad was flat, and the title menu showed no text)"""
+    STORE = (0x000fe8000000c800, 0x0000080609008388)   # STS [R9.X4 + 0x8], R6
+    ISETP_P0_R9 = (0x000fe20003f06070, 0x000000200900780c)   # ISETP P0 = R9 against 0x20 (Shared.ISETP_P0 on R9)
+
+    def test_pending_write_committed_under_a_false_guard(self):
+        code = [s2r_tid(9), waiting(self.ISETP_P0_R9), bra_to(2, 5, 0),   # the branch makes instruction 5 a block start
+                s2r(6, 0x22, guard=8), mov_imm(6, 0x3f800000, guard=0),    # @!P0 R6 deferred, then @P0 MOV R6 ending the block: the game's opposite guards
+                waiting(self.STORE), EXIT]
+        msl = self.translate(b''.join(inst(*c) for c in code), shared=0x1000)
+        self.assertIn('gl_LocalInvocationID.y', msl)   # R6's S2R reaches the store on the path through the block
 
 
 if __name__ == '__main__':

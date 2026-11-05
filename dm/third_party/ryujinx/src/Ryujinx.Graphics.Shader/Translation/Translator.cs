@@ -403,7 +403,10 @@ namespace Ryujinx.Graphics.Shader.Translation
                 {
                     Operand label;
 
-                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext())
+                    // A false guard on the block's last instruction may go straight to the next block only when no deferred write is pending: the block's end
+                    // commits them (CommitAll below), and the jump went past it. Ocarina of Time's text (vertex shader b19e1bdd247555ec): @!P0 ALD R85, a[0x84] and
+                    // then @P0 FFMA R85 last before the BSYNC that waits on the load; when P0 was false the load never reached R85, every glyph quad was flat
+                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && Array.TrueForAll(pending, p => p == null || p.Count == 0))
                     {
                         label = context.GetLabel(block.Successors[0].Address);
                     }
