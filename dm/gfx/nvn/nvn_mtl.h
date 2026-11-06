@@ -14,12 +14,14 @@ void bf_want_note(const char *key);
 
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
 void mtl_pool_add(const void *mem, uint64_t size);
+void mtl_pool_note_buffer(const void *addr);   // a buffer lives at addr: its pool is one the raw global memory table lists
 void mtl_pool_del(const void *mem);
 // memory pool Finalize: evict the textures built on this pool (pool object address) from the storage-sharing table
 void mtl_alias_drop_pool(const void *pool);
 // physical memory pool Finalize: the shared placement sparse tiles of its memory go back once no texture maps them (sp_release)
 void mtl_sp_phys_gone(const void *mem, uint64_t size);
-void mtl_pool_gpu_written(const void *pool);   // the GPU writes this pool: its uncompressed textures are no longer taken from storage (tex_cpu_content)
+void mtl_pool_gpu_written(const void *pool);
+void mtl_tex_gpu_written(const void *tex);   // the same for a texture (a tex_t): with DM_NVN_GPUW_RANGE (default) only its storage range counts as GPU-written   // the GPU writes this pool: its uncompressed textures are no longer taken from storage (tex_cpu_content)
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>
 
 typedef struct {

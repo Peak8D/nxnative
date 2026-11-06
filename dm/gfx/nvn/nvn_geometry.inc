@@ -605,6 +605,14 @@ static void mesh_tasks_draw(const p_draw *dw) {
     static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_MESH_SKIP"); skip = !e ? 0 : !strcmp(e, "indirect") ? 1 : !strcmp(e, "direct") ? 2 : !strcmp(e, "all") ? 3 : 0;
         if (skip) MLOG("DM_NVN_MESH_SKIP=%s: those task / mesh draws are skipped", e); }
     if ((skip & 1 && dw->ind) || (skip & 2 && !dw->ind)) return;
+    // Guards on indirect task / mesh draws (DM_NVN_MESH_GUARD=0 turns them off). Ocarina of Time's foliage task shaders (7c68565db6e4196d, 2b97acec27eb47ad, ...) read a {start, end} range
+    // through the raw global memory table and loop ((min(end - start, 256) - 1) >> 5) + 1 times, unsigned: a range read as 0, 0 (its pool not in the table) loops 2^27 times and the GPU hangs.
+    // So they are skipped while the table overflows (gmem_map_gpu could not list every pool), and for the rest of the run once any command buffer failed (a breaker: one hang, not a series)
+    static int guard = -1; if (guard < 0) { const char *e = getenv("DM_NVN_MESH_GUARD"); guard = !(e && !strcmp(e, "0")); MLOG("indirect task / mesh guards %s (DM_NVN_MESH_GUARD)", guard ? "on" : "off"); }
+    if (dw->ind && guard) {
+        if (atomic_load(&g_cb_err_sticky)) { RED_ONCE(154, "indirect task / mesh draws: a command buffer failed, so they are skipped for the rest of the run (breaker, DM_NVN_MESH_GUARD)"); return; }
+        if (g_gmem_over) { RED_ONCE(155, "indirect task / mesh draws skipped while the raw global memory table leaves out %d pools (their task shaders would read ranges as 0 and loop 2^27 times)", g_gmem_over); return; }
+    }
     if (!S.prog || (dw->count <= 0 && !dw->ind)) return;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
@@ -618,9 +626,9 @@ static void mesh_tasks_draw(const p_draw *dw) {
     p_draw dcpu; int was_ind = dw->ind != 0;
     if (dw->ind && ind_cpu) {
         void *mb; uint64_t mo; if (!mtl_addr(dw->ind, 8, &mb, &mo)) return;
-        uint32_t rec[2]; memcpy(rec, (const void *)(uintptr_t)dw->ind, 8); if (!rec[0]) return;
+        uint32_t rec[2]; memcpy(rec, (const void *)(uintptr_t)dw->ind, 8); if (!rec[0] || rec[0] > 65535u || rec[1] > 65535u) return;
         static int cap = -1; if (cap < 0) { const char *e = getenv("DM_NVN_MESH_MAX"); cap = e ? atoi(e) : 0; if (cap) MLOG("DM_NVN_MESH_MAX=%d: CPU-read task / mesh counts capped", cap); }
-        dcpu = *dw; dcpu.ind = 0; dcpu.count = (int32_t)MIN(rec[0], cap > 0 ? (uint32_t)cap : 65535u); dcpu.first = (int32_t)rec[1]; dw = &dcpu;
+        dcpu = *dw; dcpu.ind = 0; dcpu.count = (int32_t)MIN(rec[0], cap > 0 ? (uint32_t)cap : mesh_ind_cap()); dcpu.first = (int32_t)rec[1]; dw = &dcpu;
         { static int n; if (n++ < 8) MLOG("DM_NVN_MESH_IND_CPU: record %u, %u", rec[0], rec[1]); }
     }
     // DM_NVN_MESH_IND_LIMIT=<n> (diagnostic): only a frame's first n DrawMeshTasksIndirect draws that draw (with DM_NVN_MESH_IND_CPU, a zero count is not one), to run one at a time
@@ -652,6 +660,9 @@ static void mesh_tasks_draw(const p_draw *dw) {
         if (!e || !e->args) { RED_ONCE(151, "DrawMeshTasksIndirect skipped: its record at %#llx is in no memory pool", (unsigned long long)dw->ind); return; }
         args = e->args;
         { static int once; if (!once++) MLOG("task / mesh: first indirect draw, record at %#llx converted on the GPU", (unsigned long long)dw->ind); }
+        // DM_NVN_MESH_PROBE=1 (diagnostic): the records are converted (DM_NVN_IXCLOG=<n> logs them) but nothing is drawn: no task or mesh shader runs
+        static int probe = -1; if (probe < 0) { const char *pe = getenv("DM_NVN_MESH_PROBE"); probe = pe && atoi(pe); if (probe) MLOG("DM_NVN_MESH_PROBE=1: indirect task / mesh records converted, not drawn"); }
+        if (probe) return;
     }
     image_prepare(pr, 1u << 3 | 1u << 4);
     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
@@ -664,7 +675,9 @@ static void mesh_tasks_draw(const p_draw *dw) {
     g_geo_program = nil; g_mtk.on = 0; g_mtk.args = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
     segi_mesh(ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", (int)g_mtk.count, was_ind);
-    swrite_note(pr); g_wr_epoch++;
+    // a task / mesh program that writes no storage, image or raw global memory (prog_swrites) leaves the write epoch: the later indirect records converted with this one (ixc_run) stay
+    // valid, so the pass is not split again at the next indirect draw (DM_NVN_IXC_PAST=0: every task / mesh draw bumps it, as before)
+    swrite_note(pr); if (!ixc_past_on() || prog_swrites(pr)) g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first);
 }
 static uint64_t g_geo_mesh_n, g_geo_mesh_wait;   // mesh draws; draws the compute path drew while their mesh pipeline was built

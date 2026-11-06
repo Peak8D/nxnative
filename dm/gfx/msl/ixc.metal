@@ -4,7 +4,10 @@ using namespace metal;
 struct ajob { device const uint *rec; device uint *args; uint prim, cap; };
 kernel void ixc_arrays(device const ajob *j [[buffer(0)]], uint i [[threadgroup_position_in_grid]]) {
   device const uint *s = j[i].rec;
-  if (j[i].prim == 0x40) { device uint *d = j[i].args; d[0] = min(s[0], 65535u); d[1] = 1; d[2] = 1; d[4] = s[1]; return; }   // at most the hardware's 65535 task workgroups: a larger count is not a draw, and launched it hung the GPU   // DrawMeshTasksIndirect {count, first}: MTLDispatchThreadgroupsIndirectArguments, first at +16 (mtk_encode)
+  if (j[i].prim == 0x40) {   // DrawMeshTasksIndirect {count, first}: MTLDispatchThreadgroupsIndirectArguments, first at +16 (mtk_encode)
+    // A count or first over the hardware's 65535 task workgroups is not a draw (launched, such a count hung the GPU): nothing is drawn. A count is capped at j.cap (DM_NVN_MESH_IND_MAXN)
+    uint n = s[0], f = s[1]; bool ok = n <= 65535u && f <= 65535u; device uint *d = j[i].args;
+    d[0] = ok ? min(n, j[i].cap ? j[i].cap : 65535u) : 0u; d[1] = 1; d[2] = 1; d[4] = ok ? f : 0u; return; }
   uint n = s[0], c = j[i].prim == 7 ? n / 4 * 6 : n >= 3 ? (n - 2) * 3 : 0;
   device uint *d = j[i].args; d[0] = min(c, j[i].cap); d[1] = s[1]; d[2] = 0; d[3] = s[2]; d[4] = s[3]; }
 struct ejob { device const uint *rec; device const uchar *ib; device uint *out; device uint *args; uint prim, isz, ilen, cap; };

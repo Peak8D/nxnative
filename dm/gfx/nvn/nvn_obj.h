@@ -256,6 +256,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // Descriptor pool registration (texture ID / sampler ID → object snapshot), program release
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);
 void mtl_reg_tex_gone(int id);   // the ID stays registered, its memory pool finalized (dm/gfx/tests/nvn_replay.m: a captured registry entry, as the live run left it)
+void mtl_note_handle(uint32_t id);   // texture ID the game asked a handle for (DM_TEX_DIAG / DM_TEX_LAZY)
 void mtl_reg_image(int id, const tex_t *t, const view_t *v);   // RegisterImage declares image use even when the builder omitted IMAGE
 // textures written by WriteTexels (recorded by serial): the replay layer treats them like packaged textures, uploaded from guest memory and re-uploaded on dirty pages
 void mtl_tex_cpu_written(const tex_t *t);
