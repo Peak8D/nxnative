@@ -49,6 +49,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     uint8_t *cpu_mem = aligned_alloc(1 << 16, 4 << 20); memset(cpu_mem, 0, 4 << 20);
     mtl_pool_add(mem, POOL); mtl_pool_add(cpu_mem, 4 << 20);
     pool_t pool = {.magic = MAGIC('P','O','O','L'), .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED | NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE, .mem = mem, .size = POOL};
+    uint8_t *vmem = aligned_alloc(1 << 16, 4 << 20); memset(vmem, 0xa5, 4 << 20); mtl_pool_add(vmem, 4 << 20);
+    pool_t vpool = {.magic = MAGIC('P','O','O','L'), .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED | NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE | NVN_MEMORY_POOL_FLAGS_VIRTUAL, .mem = vmem, .size = 4 << 20};   // mapped: no sparse page table
     pool_t cpu = {.magic = MAGIC('P','O','O','L'), .flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED, .mem = cpu_mem, .size = 4 << 20};
     __weak id<MTLHeap> weak_heap = nil;
     @autoreleasepool {
@@ -91,20 +93,24 @@ int main(int argc, char **argv) { @autoreleasepool {
         CHECK(!tex_mtl(&plain).heap, "a texture without COMPRESSIBLE keeps an allocation of its own");
         tex_t sparse = target(&pool, 995004, 20 << 20, 256, 256, NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_SPARSE);
         CHECK(!tex_mtl(&sparse).heap, "a sparse texture keeps an allocation of its own");
+        tex_t virt = target(&vpool, 995006, 0, 256, 256, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+        id<MTLTexture> mv = tex_mtl(&virt);
+        CHECK(mv.heap && mv.heap != ma.heap, "a render target of a mapped virtual CPU_NO_ACCESS pool is placed in that pool's own heap");
+        mv = nil;
         tex_t visible = target(&cpu, 995005, 0, 256, 256, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
         CHECK(!tex_mtl(&visible).heap, "a render target of a pool the CPU can write keeps an allocation of its own");
         CHECK([g_res_objects containsObject:ma.heap] && ![g_res_objects containsObject:ma], "the heap is resident, not each texture");
         weak_heap = ma.heap;
-        mtl_tex_release(&b); mtl_tex_release(&c); mtl_tex_release(&plain); mtl_tex_release(&sparse); mtl_tex_release(&visible);
+        mtl_tex_release(&b); mtl_tex_release(&c); mtl_tex_release(&plain); mtl_tex_release(&sparse); mtl_tex_release(&visible); mtl_tex_release(&virt);
         mb = nil; mc = nil;
     }
     mtl_tex_release(&a); ma = nil;
-    mtl_alias_drop_pool(&pool); mtl_alias_drop_pool(&cpu);
+    mtl_alias_drop_pool(&pool); mtl_alias_drop_pool(&cpu); mtl_alias_drop_pool(&vpool);
     mtl_sub_commit(); mtl_drain(); mtl_sub_begin(); mtl_sub_commit(); mtl_drain();
     dispatch_sync(g_feedback_q, ^{}); defer_drain();
     }
     CHECK(!weak_heap || ![g_res_objects containsObject:weak_heap], "the pool's heap leaves the residency set with its last texture");
     CHECK(g_image_heap_n == 0, "no heap owner is left after the pool goes");
-    free(mem); free(cpu_mem);
+    free(mem); free(cpu_mem); free(vmem);
     printf("t_pool_heap%s: %d checks, %d failed\n", off ? " (off)" : "", checks, failed); return failed != 0;
 } }
