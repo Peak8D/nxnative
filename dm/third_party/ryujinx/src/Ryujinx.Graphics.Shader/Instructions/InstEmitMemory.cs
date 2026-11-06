@@ -2,6 +2,7 @@ using Ryujinx.Graphics.Shader.Decoders;
 using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 using Ryujinx.Graphics.Shader.Translation;
 using System.Numerics;
+using static Ryujinx.Graphics.Shader.Instructions.InstEmitAluHelper;
 using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
 using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
 
@@ -200,6 +201,24 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
         }
 
+        // nxnative (seedds #1359): a float add (RED / ATOM / ATOMS .ADD.F32.FTZ.RN) on a storage kind with no float atomic in the IR retries a compare-and-swap of the word, denormals
+        // flushed (.FTZ). Ocarina of Time's agl analysis shaders sum the scene's sky, probes and shadows this way; dropped, every sum stayed 0. Global memory keeps AtomicAddF32, which
+        // GlobalToStorage lowers (a CAS loop on a storage buffer, a float atomic through the pool table's physical pointer)
+        private static Operand EmitAtomicAddF32(EmitterContext context, StorageKind storageKind, Operand e0, Operand e1, Operand value)
+        {
+            Operand lblLoopHead = Label();
+
+            context.MarkLabel(lblLoopHead);
+
+            Operand oldValue = context.Load(storageKind, e0, e1);
+            Operand newValue = FlushDenormal(context, context.FPAdd(FlushDenormal(context, oldValue), FlushDenormal(context, value)));
+            Operand casResult = context.AtomicCompareAndSwap(storageKind, e0, e1, oldValue, newValue);
+
+            context.BranchIfTrue(lblLoopHead, context.ICompareNotEqual(casResult, oldValue));
+
+            return oldValue;
+        }
+
         private static Operand EmitAtomicOp(
             EmitterContext context,
             StorageKind storageKind,
@@ -222,6 +241,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     {
                         // nxnative: RED.F32 / ATOM.F32 (auto-exposure accumulators and the like): a float atomic add on global memory
                         res = context.AtomicAddF32(storageKind, e0, e1, value);
+                    }
+                    else if (type == AtomSize.F32FtzRn)
+                    {
+                        res = EmitAtomicAddF32(context, storageKind, e0, e1, value);
                     }
                     else
                     {

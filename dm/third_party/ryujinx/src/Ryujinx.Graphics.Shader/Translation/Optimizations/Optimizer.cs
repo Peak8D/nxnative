@@ -394,7 +394,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                         // nxnative (from MacNativeGames' translator patch 0002, after Ryujinx_Optime 01a1e37f): follow only into a producer that will be removed
                         // itself. One with side effects (an atomic, a call) stays in the block when its result is unused, so its sources are still live; dropping
                         // their uses here let the next dead-code pass delete the chain that feeds it, and the atomic then read undefined values.
-                        if (!HasSideEffects(src.AsgOp))
+                        // nxnative: and only into a producer none of whose results is used any more. MatrixMultiplyAdd (Ampere HMMA) and the shuffles with a valid flag have two
+                        // destinations: when one of them lost its last use, following into the producer dropped its sources' uses while the other result was still read, so
+                        // the next dead-code pass deleted what fed it (Ocarina of Time's NDVE network kernel 4f41ccf24f163e0d kept 1 of its 46 HMMAs, with undefined inputs)
+                        // (seedds #1343: IsUnused, i.e. also only producers whose destinations are local variables)
+                        if (IsUnused(src.AsgOp))
                         {
                             nodes.Enqueue(src.AsgOp);
                         }

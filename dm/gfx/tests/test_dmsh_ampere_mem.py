@@ -21,7 +21,7 @@ class Translated(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ampere_mem_') as d:
             work = Path(d); (work / 'k.bin').write_bytes(code)
             # c0 layout (QueryAmpereComputeC0Layout): no uniform or storage buffers, 3 texture handles from 0x10, image handles from 0x28 (word 12 = image slot 1), 0x40 bytes
-            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], **extra)]
+            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, **{'nvn2_cs': [0, 0, 3, 0x40, 0], **extra})]
             (work / 'jobs.json').write_text(json.dumps(job))
             r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -32,6 +32,38 @@ class Translated(unittest.TestCase):
                                 str(work / 'k.spv')], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout
+
+
+class SurfaceLoadLiveness(Translated):
+    # S2R R4, SR_TID.X and S2R R5, SR_TID.Y; SULD.2D RGBA R8, [R4], image slot 0.
+    COORDS = inst(0x000fe20000002100, 0x0000000000047919) + inst(0x000fe20000002200, 0x0000000000057919)
+    LOAD = inst(0x000fe200001e0f00, 0x60000a0004087b97)
+
+    @staticmethod
+    def dead_add(src):
+        # IADD3 R16, R<src>, 1, RZ, where R16 is unused.
+        return inst(0x000fe20007ffe0ff, 0x0000000100107810 | src << 24)
+
+    def test_a_dead_component_does_not_kill_the_loads_coordinates(self):
+        for dead, live in ((8, 11), (11, 8)):
+            with self.subTest(dead=dead, live=live):
+                # SUST.2D R [RZ], R<live>, image slot 1.
+                store = inst(0x000fe20000100100, 0x60000c00ff007b9b | live << 32)
+                msl = self.translate(self.COORDS + self.LOAD + self.dead_add(dead) + store + inst(*EXIT))
+                self.assertIn('.read(', msl)
+                self.assertIn('.write(', msl)
+                self.assertIn('gl_LocalInvocationID.x', msl)
+                self.assertIn('gl_LocalInvocationID.y', msl)
+
+    def test_a_load_with_all_components_dead_is_eliminated(self):
+        msl = self.translate(self.COORDS + self.LOAD + self.dead_add(8) + self.dead_add(11) + inst(*EXIT))
+        self.assertNotIn('.read(', msl)
+
+    def test_a_dead_atomic_result_preserves_the_atomic_and_its_address(self):
+        address = inst(0x000fe20000002100, 0x0000000000037919)  # S2R R3, SR_TID.X
+        msl = self.translate(address + inst(*SUATOM) + self.dead_add(12) + inst(*EXIT))
+        self.assertIn('atomic_fetch_add', msl)
+        self.assertIn('gl_LocalInvocationID.x', msl)
 
 
 class GuardedWrites(Translated):
@@ -244,6 +276,28 @@ class OcarinaOfTime(Translated):
         self.assertRegex(kernel, r'int (?P<lo>_\d+) = 4096;\s+int (?P<hi>_\d+) = 0;\s+int (?P<e>_\d+) = 0;\s+int (?P<v>_\d+) = 7;\s+'
                                  r'int (?P<r>_\d+) = _\d+\((?P=lo), (?P=hi), (?P=e), (?P=v), [^;]*\);\s+int (?P<rd>_\d+) = (?P=r);\s+_\d+\[8\] = uint\((?P=rd)\);')
         self.assertNotRegex(kernel, r'\? 1u : 0u|\? 1 : 0')
+
+
+class RedF32(Translated):
+    """RED.E.ADD.F32.FTZ.RN (0x98e, type 3 at 73..76), in Ocarina of Time's encoding (agl's sky_analyze 21d9f83e6027c565 at +0xa70, there on UR4 and R9): the IR has no float atomic, so
+    the add retries a compare-and-swap of the word. The translator used to log `Invalid reduction type: F32FtzRn` and drop the instruction"""
+    ULDC = (0x000fe40000000a00, 0x0000100000067ab9)   # ULDC.64 UR6, c[0][0x40]: storage slot 0 with the c0 layout below (3 uniform buffers, 1 storage buffer)
+    RED = (0x000fe8000c10e706, 0x00000005ff00798e)    # RED.E.ADD.F32.FTZ.RN [UR6], R5: at the start of storage slot 0
+
+    def msl(self, red=None):
+        code = mov(5, 0x3fc00000) + inst(*self.ULDC) + inst(*(red or self.RED)) + inst(*EXIT)
+        return self.translate(code, nvn2_cs=[3, 1, 0, 0x50, 0])
+
+    def test_the_add_is_kept(self):
+        msl = self.msl()
+        self.assertRegex(msl, r'atomic_compare_exchange_weak_explicit\(\(device atomic_uint\*\)&[^,]*cp_s0[^,]*\._m0\[')   # this fork: the CAS loop is GlobalToStorage's helper
+        self.assertRegex(msl, r'1\.5|1069547520')   # the value (this fork passes it to the CAS helper as its bits, 0x3fc00000)
+
+    def test_it_retries_until_the_word_held_what_it_read(self):
+        self.assertRegex(self.msl(), r'\bdo\s*\{[^}]*\}\s*while|for \(;;\)|while \(')
+
+    def test_the_sum_flushes_denormals(self):
+        self.assertIn('1.1754943508222875', self.msl())
 
 
 class Shared(Translated):

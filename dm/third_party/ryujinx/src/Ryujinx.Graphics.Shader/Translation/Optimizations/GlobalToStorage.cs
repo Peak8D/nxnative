@@ -789,7 +789,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). 1 << GmemMapLog2 entries of GmemMapEntryWords words each,
         // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0
         public const int GmemMapCbSlot = 0xff;
-        private const int GmemMapLog2 = 12;
+        private const int GmemMapLog2 = 13;   // 8,192 entries (OoT gameplay reaches ~4,100-4,500 pools; 4,096 overflowed)
         private const int GmemMapEntryWords = 8;
 
         // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
@@ -892,11 +892,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 Operand lblLogged = Label();
 
+                // A slot only ever goes from 0 to a page, so a plain read that finds the page (the usual case: a draw stores many times into a few pages) or another page
+                // is final, and only a slot read as 0 (perhaps stale) needs the compare-and-swap
                 for (int probe = 0; probe < GmemLogProbes; probe++)
                 {
                     Operand slot = context.IAdd(context.BitwiseAnd(context.IAdd(hash, Const(probe)), Const((1 << GmemLogLog2) - 1)), Const(1));
+                    Operand seen = context.Load(StorageKind.StorageBuffer, logBinding, Const(0), slot);
+                    context.BranchIfTrue(lblLogged, context.ICompareEqual(seen, page));
+
+                    Operand lblTaken = Label();
+                    context.BranchIfFalse(lblTaken, context.ICompareEqual(seen, Const(0)));
+
                     Operand old = context.AtomicCompareAndSwap(StorageKind.StorageBuffer, logBinding, Const(0), slot, Const(0), page);
                     context.BranchIfTrue(lblLogged, context.BitwiseOr(context.ICompareEqual(old, Const(0)), context.ICompareEqual(old, page)));
+                    context.MarkLabel(lblTaken);
                 }
 
                 context.Store(StorageKind.StorageBuffer, logBinding, Const(0), Const(0), Const(1));
@@ -1069,9 +1078,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                         break;
                     case Instruction.AtomicAddF32:
                         // nxnative: the storage buffer's words are u32, so the float add goes through a compare-and-swap loop
+                        // (seedds #1359: .FTZ, denormal operands and sum flushed to zero)
                         resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
                         {
-                            return context.FPAdd(memValue, value);
+                            return Instructions.InstEmitAluHelper.FlushDenormal(context, context.FPAdd(
+                                Instructions.InstEmitAluHelper.FlushDenormal(context, memValue), Instructions.InstEmitAluHelper.FlushDenormal(context, value)));
                         });
                         break;
                     case Instruction.AtomicAnd:
