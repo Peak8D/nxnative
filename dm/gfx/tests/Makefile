@@ -545,3 +545,6 @@ check_t_logic: t_logic
 t_pool_retire: t_pool_retire.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_retire.m $(MTL_T_SRC) $(FW)
 check_t_pool_retire: RUN_ENV = MTL_DEBUG_LAYER=1
+t_pool_chunk_release: t_pool_chunk_release.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_chunk_release.m $(MTL_T_SRC) $(FW)
+check_t_pool_chunk_release: RUN_ENV = MTL_DEBUG_LAYER=1

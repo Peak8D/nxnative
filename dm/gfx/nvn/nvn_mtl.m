@@ -844,7 +844,7 @@ static void big_full(big_pool *b) {   // caller holds g_mu
     for (int i = 0; i < g_npool;) {
         pool_ent *p = &g_pools[i];
         if (p->key != b->mem || i == b->full - 1) { i++; continue; }
-        [g_keep removeObject:p->buf]; defer_obj_release(p->buf);
+        defer_obj_release(p->buf); [g_keep removeObject:p->buf];   // the deferred release takes its reference first: a chunk never made resident (looked up through mtl_addr_mapped) has no other, and g_pools holds none (big_lookup)
         if (p->res) g_pool_res_n--;
         g_pools[i] = g_pools[--g_npool];
         if (i < g_npool) big_moved(i);
@@ -873,8 +873,11 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     // Lengthened: the shorter chunk is retired as a freed pool's buffer is, out of the residency set once the submissions that may use it complete. It used to stay resident until the
     // pool went: PRAGMATA's pools kept a 48 MB and a 96 MB chunk at one base, each counted whole, and the set passed Metal's working set on an 8 GB Mac. Nothing keeps its GPU address past
     // that: every cache of pool addresses is checked against g_pool_gen, which big_new bumped
+    // The deferred release takes its reference before g_keep drops its own. Not the other way round: a chunk only ever looked up through mtl_addr_mapped (tex_storage_live, for every
+    // registered texture of a pool walk) is never put into the residency set, so g_keep held its only reference, removing it freed the buffer, and defer_obj_release retained the
+    // freed object g_pools still pointed at (unretained). Ocarina of Time crashed there in objc_retain, from a pool walk during play, after 78 s once and after 25 minutes once
     if (i >= 0) {
-        [g_keep removeObject:g_pools[i].buf]; defer_obj_release(g_pools[i].buf); g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
+        defer_obj_release(g_pools[i].buf); [g_keep removeObject:g_pools[i].buf]; g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
         g_pools[i] = g_pools[n]; g_npool--; n = i;
     }
     b->chunk[k] = n + 1;
