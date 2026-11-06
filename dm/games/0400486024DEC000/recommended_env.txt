@@ -1,0 +1,9 @@
+# The Legend of Zelda: Ocarina of Time (0400486024DEC000): the environment switches of the tested build (README.md, Settings).
+# The game profile has no key for host switches, so they come from an environment file: bake it into the app with
+#   python3 scripts/build_ipa_from_nsp.py <your .nup> --platform mac-app --env-file dm/games/0400486024DEC000/recommended_env.txt
+# or copy it to ~/Library/Application Support/nxnative/0400486024DEC000/env.txt (one KEY=VALUE per line).
+DM_TEX_RELEASE=2
+DM_TEX_LAZY=2
+DM_GMEM_KEEP=new
+DM_NVN_MESH_SKIP=none
+DM_PSO_PREBUILD=0
