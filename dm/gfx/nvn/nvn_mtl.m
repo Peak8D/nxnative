@@ -5248,6 +5248,7 @@ static void shmap_read(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+    uint8_t ndve;   // the movie player's NDVE network (ndve_index): 0 not looked up, 1-22 its shader, 255 not one
     uint8_t ndsr;   // agl's four-dispatch NDSR chain (ndsr_index): 0 not looked up, 1-4 its dispatch, 5 not one
     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
     id<MTLComputePipelineState> geo_pso; int geo_pso_failed, cps_failed;   // cps_failed: Metal refused this compute shader's pipeline (dispatch): its dispatches are skipped without asking again
@@ -12762,7 +12763,7 @@ static id<MTLTexture> ndve_image(NvShader *cs, unsigned slot, tex_t *desc) {
     if (result.textureType != MTLTextureType2D || result.pixelFormat != MTLPixelFormatRGBA8Unorm || result.sampleCount != 1) return nil;
     return result;
 }
-static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp);
+static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp); static int ndve_dispatch(NvShader *cs, const p_dispatch *dp);   // the movie player's NDVE network (DM_NDVE)
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -12820,6 +12821,7 @@ static void dispatch(const p_dispatch *dp) {
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
     image_prepare(program, 0x20);
+    if (ndve_dispatch(cs, dp)) return;   // the movie player's NDVE network, replaced (DM_NDVE)
     if (ndsr_dispatch(cs, dp)) return;   // agl's four-dispatch NDSR upscaler, replaced as a whole (DM_NDSR)
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     int own = dispatch_own();
@@ -14610,6 +14612,103 @@ static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp) {
     if (!ok) return ndsr_fail(m == NDSR_METALFX ? "MetalFX did not draw" : "the bilinear draw failed", cs);
     if (!g_ndsr_n++) MLOG("NDSR replacement: first frame, %lux%lu (format %lu) → %lux%lu (format %lu) by %s%s", (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat,
                           (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat, m == NDSR_METALFX ? "MetalFX" : "a bilinear draw", m == NDSR_METALFX ? (perc ? " (perceptual)" : " (HDR)") : "");
+    return 1;
+}
+// ---------- the movie player's NDVE video super-resolution (nn::movie, RLA1 networks), replaced (DM_NDVE) ----------
+// Ocarina of Time's prerendered movies (title background, intro): 22 compute shaders (shader_map.tsv NDSR c2fc2ddd / 4f41ccf2, RLA1 blobs 1-4) run a network over the decoded picture each
+// movie frame, ~37 ms of GPU, which caps the movies at ~26 fps. DM_NDVE_LOG=<n>: the first n of their dispatches logged with the bindings (dispatch order, what the chain reads and writes)
+static const char g_ndve_keys[22][17] = {"c2fc2ddd604c25e7", "4f41ccf24f163e0d",
+    "ba079f68ae288dba", "a8b4fb48fee0ccf8", "e2eebd7ba18fe35f", "e6be82d835fbe4d3", "9442573ee4ace011", "0a56002cdc7e1fce", "d15370a382630d4e", "7f7ff0f36b54d90f", "5a7d69b067a7f011",
+    "329e4b0f0b3f2bc6", "7653fe5f6ef0b2f2", "b6e34b46dea44278", "3f18f89630c05813", "539ad3b353758de0", "d72077c4b6cc264f", "ab9a92b55950ec02", "c41f451b88a050f6", "55ee6dc89a2b64e2",
+    "49dff010b9832251", "8e98d86c0e4a7b53"};
+static int ndve_index(NvShader *cs) {
+    if (!cs->ndve) { cs->ndve = 255; for (int i = 0; i < 22; i++) if (!strncmp(cs->key, g_ndve_keys[i], 16)) cs->ndve = (uint8_t)(i + 1); }
+    return cs->ndve <= 22 ? cs->ndve - 1 : -1;
+}
+static void ndve_log(NvShader *cs, const p_dispatch *dp, int i) {
+    static int lim = -1, n; if (lim < 0) { const char *e = getenv("DM_NDVE_LOG"); lim = e ? atoi(e) : 0; }
+    if (n >= lim) return;
+    n++;
+    char b[2048]; int o = 0; const uint32_t *pc = (const uint32_t *)S.push[1];
+    o += snprintf(b + o, sizeof b - o, "NDVE log %d: present %llu, #%d %s, groups %ux%ux%u%s, push %08x %08x %08x %08x %08x %08x %08x %08x;", n, (unsigned long long)g_present_n, i, cs->key, dp->x, dp->y, dp->z,
+                  dp->ind ? " indirect" : "", pc[0], pc[1], pc[2], pc[3], pc[4], pc[5], pc[6], pc[7]);
+    for (int k = 0; k < cs->rf.nb && o < (int)sizeof b - 200; k++) {
+        const nvn_rbind *rb = &cs->rf.b[k]; int kind = rb->kind;
+        if (kind == NVN_RB_TEX || kind == NVN_RB_IMG) {
+            int tid = kind == NVN_RB_TEX ? (int)(tex_slot_h(S.tex[5], S.img[5], rb->reg) & 0xfffff) : rb->reg < 32 ? (int)(S.img[5][rb->reg] & 0xfffff) : 0;
+            os_unfair_lock_lock(&g_rmu);
+            id<MTLTexture> t = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? tex_by_id(tid) : nil; tex_t tt = t ? g_treg[tid].t : (tex_t){0};
+            os_unfair_lock_unlock(&g_rmu);
+            o += snprintf(b + o, sizeof b - o, " %s%u=%d", kind == NVN_RB_TEX ? "t" : "i", rb->reg, tid);
+            if (t) o += snprintf(b + o, sizeof b - o, "(%lux%lu f%lu u%lx ser %llu mem %p nvf %u)", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.usage,
+                                 (unsigned long long)tt.serial, (void *)tt.mem, (unsigned)tt.d.format);
+        } else if (kind == NVN_RB_SBUFP || kind == NVN_RB_CBUF) {
+            const p_bind_buf *u = kind == NVN_RB_SBUFP ? &S.ssbo[5][rb->reg & 15] : &S.ubo[5][rb->reg & 15];
+            o += snprintf(b + o, sizeof b - o, " %s%u=%#llx+%#llx%s", kind == NVN_RB_SBUFP ? "s" : "c", rb->reg, (unsigned long long)u->addr, (unsigned long long)u->size, kind == NVN_RB_SBUFP && rb->rw ? "w" : "");
+        } else o += snprintf(b + o, sizeof b - o, " k%d.%u", kind, rb->reg);
+    }
+    MLOG("%s", b);
+}
+// The chain seen in a title run (DM_NDVE_LOG, NOTES 2026-11-05 ~17:30), per movie frame: #20 49dff010 (colour conversion: t1 = Y R8 1920x1080, t2 = CbCr RG8 960x540 → image 0 = RGBA8 1920x1080,
+// gamma-encoded video colour), #2-#10 (the RLA1 network over that picture: buffers, #10 writes an RGB10A2 1920x1080 image), #1 4f41ccf2 (NDSR upscale: texture 0 = the network's picture,
+// image 1 = the RGBA8 2560x1440 output; push constants = input / output rectangles as up_mfx_rect reads them). DM_NDVE=metalfx (default): #20 runs, the network is skipped, and MetalFX's spatial
+// scaler (perceptual, the colour kept encoded) scales #20's picture into #1's output rectangle; off: a bilinear draw instead; game: the game's shaders. Read at every movie frame (ctl "env").
+// Anything unexpected (a shader outside that order, bindings, sizes, MetalFX refusing) keeps the game's chain from the next movie frame on
+enum { NDVE_GAME, NDVE_METALFX, NDVE_OFF };
+static int g_ndve_armed, g_ndve_failed, g_ndve_last = -1; static id<MTLTexture> g_ndve_in; static uint64_t g_ndve_n, g_ndve_skipped;
+static int ndve_mode(void) {
+    const char *e = getenv("DM_NDVE");
+    int m = !e || !*e || !strcmp(e, "metalfx") ? NDVE_METALFX : !strcmp(e, "off") ? NDVE_OFF : NDVE_GAME;
+    static int fx = -1; if (fx < 0) fx = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev];
+    if (m == NDVE_METALFX && !fx) m = NDVE_GAME;
+    if (m != g_ndve_last) { MLOG("movie NDVE (DM_NDVE=%s): %s", e ? e : "", m == NDVE_METALFX ? "MetalFX spatial scaler" : m == NDVE_OFF ? "bilinear draw" : "the game's network"); g_ndve_last = m; }
+    return m;
+}
+static int ndve_fail(const char *why, NvShader *cs) { MLOG("[RED] NDVE replacement: %s (%s); the game's network runs from the next movie frame", why, cs->key); g_ndve_failed = 1; g_ndve_armed = 0; g_ndve_in = nil; return 0; }
+// 1 when dispatch dp of cs is taken (skipped or replaced), 0 to run it
+static int ndve_dispatch(NvShader *cs, const p_dispatch *dp) {
+    int i = ndve_index(cs); if (i < 0) return 0;
+    ndve_log(cs, dp, i);
+    if (i == 20) {   // the colour conversion: runs; its image is the scaler's input
+        g_ndve_armed = 0; g_ndve_in = nil;
+        int m = g_ndve_failed ? NDVE_GAME : ndve_mode(); if (m == NDVE_GAME || dp->ind) return 0;
+        int oi = ndsr_bind(cs, NVN_RB_IMG); if (oi < 0 || cs->rf.b[oi].reg >= 32) return ndve_fail("the colour conversion has not one image", cs);
+        int tid = (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff);
+        os_unfair_lock_lock(&g_rmu);
+        id<MTLTexture> in = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? tex_by_id(tid) : nil;
+        os_unfair_lock_unlock(&g_rmu);
+        if (!in || in.textureType != MTLTextureType2D || in.sampleCount != 1 || fmt_int_or_ds(in.pixelFormat) || mtl_fmt_block(in.pixelFormat))
+            return ndve_fail("the converted picture is not a single-sampled 2D colour texture", cs);
+        g_ndve_in = in; g_ndve_armed = m;
+        return 0;
+    }
+    if (!g_ndve_armed) return 0;
+    if (i >= 2 && i <= 10) { g_ndve_skipped++; return 1; }   // the network
+    if (i != 1 && i != 0) return ndve_fail("a shader outside the chain seen so far", cs);
+    int m = g_ndve_armed; id<MTLTexture> in = g_ndve_in; g_ndve_armed = 0; g_ndve_in = nil;
+    int oi = ndsr_bind(cs, NVN_RB_IMG); if (oi < 0 || cs->rf.b[oi].reg >= 32) return ndve_fail("the upscale has not one image", cs);
+    int tout = (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff);
+    tex_t dout = {0}; uint64_t rid = 0; int real = 0; id<MTLTexture> out = nil;
+    os_unfair_lock_lock(&g_rmu);
+    if (tout > 0 && tout < g_ntreg && g_treg[tout].ok) { dout = g_treg[tout].t; out = img_binding(tout, &cs->rf.b[oi], &rid, &real); if (!real) out = nil; }
+    os_unfair_lock_unlock(&g_rmu);
+    uint32_t v[8]; memcpy(v, S.push[1], sizeof v);
+    NVNcopyRegion ir, orr;
+    if (!out || out == in || out.textureType != MTLTextureType2D || out.sampleCount != 1 || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !(out.usage & MTLTextureUsageRenderTarget))
+        return ndve_fail("the output image is not a 2D colour target", cs);
+    if (!up_mfx_rect(v, in.width, in.height, &ir) || !up_mfx_rect(v + 4, out.width, out.height, &orr)) return ndve_fail("the rectangles do not fit the textures", cs);
+    int ok;
+    if (m == NDVE_METALFX && (orr.width > ir.width || orr.height > ir.height) && orr.width >= ir.width && orr.height >= ir.height) ok = up_mfx_run(in, out, dout.serial, ir, orr, 2, cs->key);
+    else {
+        zskip_del(dout.serial); rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        ubd_land_compute();
+        ok = copy_t2t_draw(in, out, 0, 0, 0, 0, &ir, &orr, 1, 0);
+        args_dirty_all();
+    }
+    if (!ok) return ndve_fail(m == NDVE_METALFX ? "MetalFX did not draw" : "the bilinear draw failed", cs);
+    if (!g_ndve_n++) MLOG("NDVE replacement: first movie frame, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu) by %s; %llu network dispatches skipped",
+                          ir.width, ir.height, ir.xoffset, ir.yoffset, (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset,
+                          (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat, m == NDVE_METALFX ? "MetalFX (perceptual)" : "a bilinear draw", (unsigned long long)g_ndve_skipped);
     return 1;
 }
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
