@@ -4243,7 +4243,20 @@ enum { POOL_HEAP_GRAIN = 64 << 10 };
 - (void)dealloc { free(used); }
 @end
 static nvn_hmap g_pool_heap = {.klen = sizeof(void *)};   // pool object → NvPoolHeap (retained), under g_smu; dropped with the pool (mtl_alias_drop_pool)
+static id<MTLTexture> pool_heap_texture_(const tex_t *t, MTLTextureDescriptor *d);
+// A pool heap's textures are made without GPU-optimized contents (no lossless compression; DM_NVN_POOL_HEAP_OPT=1 keeps it). Over memory another texture covered, a texture reads what that
+// one left, as on NVN, and the engine counts on it being colours: a compressed texture's bytes read through another texture's compression state decode as anything. Ocarina of Time's
+// volumetric fog took such reads into its extinction: soft teal smudges (red taken out) and pink ones over Kakariko's ground and stones by day, 100-250 detector cells a shot -> none
+// (30-45 cells left, the detector's own on cool shadows and edges; GPU time and memory the same)
 static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d) {
+    static int opt = -1; if (opt < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_OPT"); opt = e && atoi(e) > 0; if (opt) MLOG("DM_NVN_POOL_HEAP_OPT=1: pool heaps' textures keep GPU-optimized contents (lossless compression)"); }
+    if (opt) return pool_heap_texture_(t, d);
+    BOOL was = d.allowGPUOptimizedContents; d.allowGPUOptimizedContents = NO;
+    id<MTLTexture> mt = pool_heap_texture_(t, d);
+    if (!mt) d.allowGPUOptimizedContents = was;   // the caller makes it elsewhere, as it was described
+    return mt;
+}
+static id<MTLTexture> pool_heap_texture_(const tex_t *t, MTLTextureDescriptor *d) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_POOL_HEAP"); on = !e || atoi(e); }
     const pool_t *p = t->pool;
     if (!on || !p || !p->mem || !(p->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || (p->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || nvn_sparse_pool(p)) return nil;
