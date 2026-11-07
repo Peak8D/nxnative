@@ -125,6 +125,7 @@ static void separate_storage(pool_t *pool, id<MTLHeap> original) {
     mtl_alias_drop_pool(&other_pool); mtl_alias_drop_pool(&cpu_pool);
 }
 int main(void) { @autoreleasepool {
+    setenv("DM_NVN_POOL_HEAP", "0", 1);   // the family path alone: with the pool's heap on, a CPU_NO_ACCESS pool's families go into it first (t_pool_heap checks that)
     mtl_init(); __weak id<MTLHeap> weak_heap; void *mem=NULL;
     posix_memalign(&mem,16384,16<<20); memset(mem,0,16<<20);
     @autoreleasepool {

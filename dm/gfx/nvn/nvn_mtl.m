@@ -4589,9 +4589,13 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     if (!mt) {
         MTLTextureDescriptor *d = tex_desc(t, 0);
         if (!d) return nil;
-        mt = image_texture(t, d);
+        // The pool's heap first: it holds all of a GPU-only pool's storage, every offset, as NVN's memory is one; a resolution family's heap holds one offset's sizes beside it.
+        // Taken the other way round, once families took render targets without the image flag (b8838d3) and mapped virtual pools had heaps, Ocarina of Time's dynamic-resolution
+        // targets went into 50-60 family heaps (about 400 MB, more with each new size) over storage its pools' heaps already held. Families keep what the pool's heap does not
+        // take: a texture past its scaled range, a pool larger than POOL_HEAP_MAX, DM_NVN_POOL_HEAP=0
+        mt = pool_heap_texture(t, d);
         int filled = 0;
-        if (!mt) mt = pool_heap_texture(t, d);
+        if (!mt) mt = image_texture(t, d);
         if (!mt) rt_lossy(d);   // DM_NVN_RT_LOSSY
         if (!mt && (mt = rc_take(d, t))) { res_add(mt); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); }   // DM_NVN_RT_RECLAIM's free list
         else if (!mt && (mt = trc_take(d))) { if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); }   // a recycled one: still resident (see trc_released)

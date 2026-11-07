@@ -89,6 +89,16 @@ int main(int argc, char **argv) { @autoreleasepool {
         CHECK(holds(ma, 0x11223344) && holds(mc, 0x55667788), "a late image's writes do not reach separate pool storage");
         mtl_tex_release(&img); mtl_tex_release(&img2); mi = nil; mi2 = nil;
 
+        // Two live sizes of one render target at one offset (a dynamic-resolution target, COMPRESSIBLE alone, both declared before either is used): the pool's heap takes them
+        // at that offset, as the image family path would give them a heap of their own beside the pool's (Ocarina of Time: 50-60 such heaps, about 400 MB, while its pools' heaps held the same storage)
+        int heaps0 = atomic_load(&g_image_heap_n);
+        tex_t dr0 = target(&pool, 995020, 28 << 20, 512, 512, NVN_TEXTURE_FLAGS_COMPRESSIBLE), dr1 = target(&pool, 995021, 28 << 20, 544, 544, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+        id<MTLTexture> md0 = tex_mtl(&dr0), md1 = tex_mtl(&dr1);
+        CHECK(md0.heap == ma.heap && md1.heap == ma.heap, "the sizes of a resolution family in the pool share the pool's heap");
+        CHECK(md0.heapOffset == md1.heapOffset && md0.heapOffset >= (NSUInteger)((double)(28 << 20) * POOL_HEAP_SCALE) - (1 << 20), "at their scaled pool offset, over each other");
+        CHECK(atomic_load(&g_image_heap_n) == heaps0, "no family heap is made beside the pool's");
+        mtl_tex_release(&dr0); mtl_tex_release(&dr1); md0 = nil; md1 = nil;
+
         tex_t plain = target(&pool, 995003, 16 << 20, 256, 256, 0);
         CHECK(!tex_mtl(&plain).heap, "a texture without COMPRESSIBLE keeps an allocation of its own");
         tex_t sparse = target(&pool, 995004, 20 << 20, 256, 256, NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_SPARSE);
